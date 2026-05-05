@@ -1,0 +1,288 @@
+//@version=5
+// =============================================================
+// AKÇAY Tactical Silver v1.0
+// XAGUSD adaptation of the Gold v2.8 three-layer architecture.
+// Silver is more volatile and spike-prone → this script is more
+// selective than its Gold counterpart. No execution, no webhook.
+// =============================================================
+indicator("AKÇAY Tactical Silver v1.0", shorttitle="AKÇAY Silver v1.0",
+     overlay=true, max_labels_count=500, max_lines_count=500)
+
+// =============================================================
+// 1. INPUTS — Silver-specific starting parameters
+// =============================================================
+gSilver = "Silver Parameters"
+midZoneThresh  = input.float(0.0018, "Mid Zone Threshold",         step=0.0001, group=gSilver)
+atrBufRej      = input.float(0.9,    "Rejection ATR Buffer",       step=0.1,    group=gSilver)
+atrBufBO       = input.float(1.1,    "Breakout ATR Buffer",        step=0.1,    group=gSilver)
+lateBoRsiLong  = input.int  (65,     "Late BO RSI Long Threshold",              group=gSilver)
+lateBoRsiShort = input.int  (35,     "Late BO RSI Short Threshold",             group=gSilver)
+emaTol         = input.float(0.0012, "EMA Tolerance",              step=0.0001, group=gSilver)
+
+gCore = "Core Indicators"
+emaLen   = input.int(20, "EMA Length",          group=gCore)
+rsiLen   = input.int(14, "RSI Length",          group=gCore)
+atrLen   = input.int(14, "ATR Length",          group=gCore)
+slopeLb  = input.int(3,  "EMA Slope Lookback",  group=gCore)
+htfRes   = input.timeframe("15", "HTF Bias Timeframe", group=gCore)
+
+gRisk = "Risk / TP-SL"
+slAtrMult      = input.float(1.2,  "Late BO SL ATR Multiplier",      step=0.1,  group=gRisk)
+slStructBufAtr = input.float(0.25, "Rejection SL Structural Buffer (ATR)", step=0.05, group=gRisk)
+tp1R           = input.float(1.0,  "TP1 R-multiple",                 step=0.1,  group=gRisk)
+tp2R           = input.float(2.0,  "TP2 R-multiple",                 step=0.1,  group=gRisk)
+tp3R           = input.float(3.0,  "TP3 R-multiple",                 step=0.1,  group=gRisk)
+scalpR         = input.float(0.8,  "Late BO Scalp TP (R)",           step=0.1,  group=gRisk)
+
+gVis = "Visuals"
+maxLabels = input.int(100, "Max Labels", minval=10, group=gVis)
+showEarly = input.bool(false, "Show Early Signals",        group=gVis)
+showRej   = input.bool(true, "Show Confirmed Rejection",   group=gVis)
+showBO    = input.bool(true, "Show Late BO",               group=gVis)
+showLevels= input.bool(true, "Show TP / SL levels",        group=gVis)
+
+// =============================================================
+// 2. CORE INDICATORS — execution timeframe (chart)
+// =============================================================
+ema20    = ta.ema(close, emaLen)
+rsi      = ta.rsi(close, rsiLen)
+atr      = ta.atr(atrLen)
+emaSlope = ema20 - ema20[slopeLb]
+
+// =============================================================
+// 3. HTF BIAS — light 15m filter (2/3 confirmation)
+// =============================================================
+[htfClose, htfEma, htfRsi, htfEmaPrev] = request.security(
+     syminfo.tickerid, htfRes,
+     [close, ta.ema(close, emaLen), ta.rsi(close, rsiLen), ta.ema(close, emaLen)[slopeLb]],
+     lookahead = barmerge.lookahead_off)
+htfSlope = htfEma - htfEmaPrev
+
+biasLongScore  = (htfClose > htfEma  ? 1 : 0) + (htfRsi > 50 ? 1 : 0) + (htfSlope > 0 ? 1 : 0)
+biasShortScore = (htfClose < htfEma  ? 1 : 0) + (htfRsi < 50 ? 1 : 0) + (htfSlope < 0 ? 1 : 0)
+
+biasLong         = biasLongScore  >= 2
+biasShort        = biasShortScore >= 2
+biasNeutralLong  = not biasLong and not biasShort and htfRsi > 50
+biasNeutralShort = not biasLong and not biasShort and htfRsi < 50
+
+// =============================================================
+// 4. ZONE / TOLERANCE FILTERS
+// =============================================================
+midZoneRange = ema20 * midZoneThresh
+emaTolRange  = ema20 * emaTol
+
+flatEma     = math.abs(emaSlope) < midZoneRange * 0.6
+inMidZone   = math.abs(close - ema20) < midZoneRange and flatEma
+nearEma     = math.abs(close - ema20) <= emaTolRange
+distFromEma = math.abs(close - ema20)
+
+// =============================================================
+// 5. SPIKE / FAKE BREAKOUT FILTER
+// =============================================================
+candleRange = high - low
+bodySize    = math.abs(close - open)
+spikeBar    = candleRange > atr * 2.0 and bodySize < candleRange * 0.4
+
+// =============================================================
+// 6. SHORT-TERM STRUCTURE
+// =============================================================
+shortUp   = close > close[1] and close[1] > close[2]
+shortDown = close < close[1] and close[1] < close[2]
+strongBull = close > open and (close - open) > candleRange * 0.55
+strongBear = open  > close and (open - close) > candleRange * 0.55
+
+// =============================================================
+// 7. 5m EXECUTION CORE
+// =============================================================
+canLong5m  = (close > ema20 or nearEma) and rsi > 50 and shortUp   and not inMidZone and not spikeBar
+canShort5m = (close < ema20 or nearEma) and rsi < 50 and shortDown and not inMidZone and not spikeBar
+
+// =============================================================
+// 8. EARLY TRADE — visual only, no execution
+// =============================================================
+// Reclaim: previous bar was at/below EMA tolerance band, this bar closes above EMA.
+priorNearOrBelowEma = close[1] <= ema20[1] + emaTolRange or low[1] < ema20[1]
+priorNearOrAboveEma = close[1] >= ema20[1] - emaTolRange or high[1] > ema20[1]
+
+reclaimLong  = priorNearOrBelowEma and close > ema20
+loseShort    = priorNearOrAboveEma and close < ema20
+
+earlyLong  = (biasLong  or biasNeutralLong)  and reclaimLong and rsi > 52 and strongBull and not inMidZone and not spikeBar
+earlyShort = (biasShort or biasNeutralShort) and loseShort   and rsi < 48 and strongBear and not inMidZone and not spikeBar
+
+// =============================================================
+// 9. CONFIRMED REJECTION — main tradable signal
+// =============================================================
+// Long: wick probes EMA from above, body closes back up
+rejLongCandle  = low  <= ema20 + emaTolRange and close > ema20 and close > open and (close - low)  > bodySize
+rejShortCandle = high >= ema20 - emaTolRange and close < ema20 and close < open and (high - close) > bodySize
+
+// Stricter: require body >= max(atrBufRej * 0.5, 0.45) of ATR
+rejBodyMin    = math.max(atr * atrBufRej * 0.5, atr * 0.45)
+rejLongAtrOk  = bodySize >= rejBodyMin
+rejShortAtrOk = bodySize >= rejBodyMin
+
+// --- A+ QUALITY FILTERS ---------------------------------------
+// Cooldown: > 5 bars between fired Confirmed Rejection triggers.
+// Equivalent to ta.barssince(trigConfLong or trigConfShort) > 5,
+// implemented via a last-fire bar tracker to avoid forward refs.
+var int lastConfTrigBar = na
+barsSinceSignal = na(lastConfTrigBar) ? 9999 : bar_index - lastConfTrigBar
+cooldownOk      = barsSinceSignal > 5
+
+// Not-extended: block late entries far from EMA20
+notExtended = distFromEma < atr * 1.5
+
+// A+ Confirmed Rejection — strict bias, RSI >=55 / <=45, distance, cooldown
+confLong  = biasLong  and canLong5m  and rejLongCandle  and rsi >= 55 and rejLongAtrOk  and not inMidZone and notExtended and cooldownOk
+confShort = biasShort and canShort5m and rejShortCandle and rsi <= 45 and rejShortAtrOk and not inMidZone and notExtended and cooldownOk
+
+// =============================================================
+// 10. LATE BO / SCALP CONTINUATION — strict filters (scalp-only)
+// =============================================================
+hh20 = ta.highest(high, 20)
+ll20 = ta.lowest(low, 20)
+
+notTooFar   = distFromEma < atr * 2.0
+
+// Stricter fake-breakout protection:
+//  - Bar CLOSE (not just wick) must be beyond prior extreme
+//  - Strong body (>= 55% of candle range)
+//  - ATR body floor: max(atrBufBO * 0.5, 0.5 * ATR)
+//  - Not a spike bar
+boBodyMin    = math.max(atr * atrBufBO * 0.5, atr * 0.5)
+boStrongBull = close > open and (close - open) >= candleRange * 0.55
+boStrongBear = open  > close and (open - close) >= candleRange * 0.55
+
+lateBoLong  = biasLong  and close > high[1] and close > hh20[1] and rsi >= lateBoRsiLong  and notTooFar and bodySize >= boBodyMin and boStrongBull and not spikeBar
+lateBoShort = biasShort and close < low[1]  and close < ll20[1] and rsi <= lateBoRsiShort and notTooFar and bodySize >= boBodyMin and boStrongBear and not spikeBar
+
+// =============================================================
+// 11. BAR-CLOSE CONFIRMATION + SIGNAL PRIORITY
+//     Priority on same bar: Confirmed Rejection > Late BO > Early
+// =============================================================
+confirm = barstate.isconfirmed
+
+trigConfLong   = showRej   and confLong    and confirm
+trigConfShort  = showRej   and confShort   and confirm
+
+// Cooldown tracker — record bar index when a Confirmed Rejection fires
+if trigConfLong or trigConfShort
+    lastConfTrigBar := bar_index
+
+confFiredAny   = trigConfLong or trigConfShort
+trigLateLong   = showBO    and lateBoLong  and confirm and not confFiredAny
+trigLateShort  = showBO    and lateBoShort and confirm and not confFiredAny
+
+higherFiredAny = confFiredAny or trigLateLong or trigLateShort
+trigEarlyLong  = showEarly and earlyLong   and confirm and not higherFiredAny
+trigEarlyShort = showEarly and earlyShort  and confirm and not higherFiredAny
+
+// =============================================================
+// 12. ROLLING LABEL / LINE ARRAYS (prevent label explosion)
+// =============================================================
+var label[] labels = array.new<label>()
+var line[]  lines  = array.new<line>()
+
+pushLabel(label _l) =>
+    array.push(labels, _l)
+    if array.size(labels) > maxLabels
+        label.delete(array.shift(labels))
+
+pushLine(line _ln) =>
+    array.push(lines, _ln)
+    if array.size(lines) > maxLabels
+        line.delete(array.shift(lines))
+
+// =============================================================
+// 13. SIGNAL & TP/SL DRAW HELPERS
+// =============================================================
+drawSignalLabel(string txt, bool isLong, color bg, color txtCol) =>
+    yPos  = isLong ? low - atr * 0.6 : high + atr * 0.6
+    style = isLong ? label.style_label_up : label.style_label_down
+    pushLabel(label.new(bar_index, yPos, txt, style=style, color=bg, textcolor=txtCol, size=size.small))
+
+drawTpSl(bool isLong, float entry, float sl) =>
+    if showLevels
+        slDist = math.abs(entry - sl)
+        tp1 = isLong ? entry + slDist * tp1R : entry - slDist * tp1R
+        tp2 = isLong ? entry + slDist * tp2R : entry - slDist * tp2R
+        tp3 = isLong ? entry + slDist * tp3R : entry - slDist * tp3R
+
+        pushLine(line.new(bar_index, entry, bar_index + 8, entry, color=color.new(color.gray, 0),  style=line.style_dotted))
+        pushLine(line.new(bar_index, sl,    bar_index + 8, sl,    color=color.new(color.red, 0)))
+        pushLine(line.new(bar_index, tp1,   bar_index + 8, tp1,   color=color.new(color.lime, 30)))
+        pushLine(line.new(bar_index, tp2,   bar_index + 8, tp2,   color=color.new(color.lime, 15)))
+        pushLine(line.new(bar_index, tp3,   bar_index + 8, tp3,   color=color.new(color.lime, 0)))
+
+        pushLabel(label.new(bar_index + 8, entry, "Entry " + str.tostring(entry, format.mintick), style=label.style_label_left, color=color.new(color.gray, 60),  textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 8, sl,    "SL "    + str.tostring(sl,    format.mintick), style=label.style_label_left, color=color.new(color.red, 30),   textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 8, tp1,   "TP1 "   + str.tostring(tp1,   format.mintick), style=label.style_label_left, color=color.new(color.green, 40), textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 8, tp2,   "TP2 "   + str.tostring(tp2,   format.mintick), style=label.style_label_left, color=color.new(color.green, 25), textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 8, tp3,   "TP3 "   + str.tostring(tp3,   format.mintick), style=label.style_label_left, color=color.new(color.green, 10), textcolor=color.white, size=size.tiny))
+
+drawScalp(bool isLong, float entry, float slDist) =>
+    if showLevels
+        sl    = isLong ? entry - slDist          : entry + slDist
+        scalp = isLong ? entry + slDist * scalpR : entry - slDist * scalpR
+        pushLine(line.new(bar_index, entry, bar_index + 6, entry, color=color.new(color.gray, 0), style=line.style_dotted))
+        pushLine(line.new(bar_index, sl,    bar_index + 6, sl,    color=color.new(color.red, 0)))
+        pushLine(line.new(bar_index, scalp, bar_index + 6, scalp, color=color.new(color.aqua, 0)))
+        pushLabel(label.new(bar_index + 6, entry, "Entry "    + str.tostring(entry, format.mintick), style=label.style_label_left, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 6, sl,    "SL "       + str.tostring(sl,    format.mintick), style=label.style_label_left, color=color.new(color.red, 30),  textcolor=color.white, size=size.tiny))
+        pushLabel(label.new(bar_index + 6, scalp, "Scalp TP " + str.tostring(scalp, format.mintick), style=label.style_label_left, color=color.new(color.aqua, 30), textcolor=color.white, size=size.tiny))
+
+// =============================================================
+// 14. SIGNAL DRIVERS
+// =============================================================
+// Confirmed Rejection: structural SL anchored to rejection candle wick
+rejStructBuf = atr * slStructBufAtr
+slLongRej    = low  - rejStructBuf
+slShortRej   = high + rejStructBuf
+
+// Late BO: keeps generic ATR distance for scalp SL
+slDistBO = atr * slAtrMult
+
+if trigConfLong
+    drawSignalLabel("CONF REJ LONG", true, color.new(color.green, 0), color.white)
+    drawTpSl(true, close, slLongRej)
+
+if trigConfShort
+    drawSignalLabel("CONF REJ SHORT", false, color.new(color.red, 0), color.white)
+    drawTpSl(false, close, slShortRej)
+
+if trigLateLong
+    drawSignalLabel("LATE BO LONG", true, color.new(color.blue, 0), color.white)
+    drawScalp(true, close, slDistBO)
+
+if trigLateShort
+    drawSignalLabel("LATE BO SHORT", false, color.new(color.maroon, 0), color.white)
+    drawScalp(false, close, slDistBO)
+
+if trigEarlyLong
+    drawSignalLabel("EARLY LONG", true, color.new(color.teal, 30), color.white)
+
+if trigEarlyShort
+    drawSignalLabel("EARLY SHORT", false, color.new(color.orange, 30), color.white)
+
+// =============================================================
+// 15. PLOTS — kept within plot_0 .. plot_19 budget
+// =============================================================
+plot(ema20,                  "EMA20",        color=color.new(color.yellow, 0), linewidth=2)   // plot_0
+plot(ema20 + emaTolRange,    "EMA + tol",    color=color.new(color.gray, 70))                 // plot_1
+plot(ema20 - emaTolRange,    "EMA - tol",    color=color.new(color.gray, 70))                 // plot_2
+plot(ema20 + midZoneRange,   "Mid Zone Top", color=color.new(color.purple, 80))               // plot_3
+plot(ema20 - midZoneRange,   "Mid Zone Bot", color=color.new(color.purple, 80))               // plot_4
+
+bgcolor(inMidZone ? color.new(color.purple, 92) : na, title="Mid Zone Highlight")
+bgcolor(biasLong  ? color.new(color.green,  95) : biasShort ? color.new(color.red, 95) : na, title="HTF Bias Tint")
+
+// =============================================================
+// 16. ALERT PLACEHOLDERS — modular, off by default (no webhook)
+// User can manually wire these to TradingView alerts if desired.
+// =============================================================
+alertcondition(trigConfLong,   title="Confirmed Rejection LONG",  message="AKÇAY Silver: Confirmed Rejection LONG")
+alertcondition(trigConfShort,  title="Confirmed Rejection SHORT", message="AKÇAY Silver: Confirmed Rejection SHORT")
+alertcondition(trigLateLong,   title="Late BO LONG",              message="AKÇAY Silver: Late BO LONG")
+alertcondition(trigLateShort,  title="Late BO SHORT",             message="AKÇAY Silver: Late BO SHORT")

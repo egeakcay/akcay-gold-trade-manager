@@ -77,6 +77,12 @@ from datetime import datetime, timezone
 from typing import Dict, Literal, Optional, Set
 
 import httpx
+
+try:
+    import asyncpg
+except ImportError:  # Allows local syntax checks before installing requirements.
+    asyncpg = None
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -88,6 +94,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+db_pool = None
 
 CAPITAL_GBP = float(os.getenv("CAPITAL_GBP", "5000"))
 
@@ -158,6 +166,140 @@ class Trade:
 
 active_trades: Dict[str, Trade] = {}
 processed_global_events: Set[str] = set()
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    """Create the Postgres connection pool and performance table if DATABASE_URL is configured."""
+    global db_pool
+
+    if not DATABASE_URL:
+        print("DATABASE_URL not configured. Performance logging disabled.")
+        return
+
+    if asyncpg is None:
+        raise RuntimeError("asyncpg is not installed. Add asyncpg to requirements.txt")
+
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id TEXT PRIMARY KEY,
+            instrument TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry DOUBLE PRECISION NOT NULL,
+            stop DOUBLE PRECISION NOT NULL,
+            tp1 DOUBLE PRECISION NOT NULL,
+            tp2 DOUBLE PRECISION NOT NULL,
+            lot DOUBLE PRECISION NOT NULL,
+            risk_gbp DOUBLE PRECISION NOT NULL,
+            risk_percent DOUBLE PRECISION NOT NULL,
+            setup TEXT,
+            quality TEXT,
+            status TEXT NOT NULL,
+            result TEXT,
+            result_r DOUBLE PRECISION,
+            pnl_gbp DOUBLE PRECISION,
+            last_price DOUBLE PRECISION,
+            entry_time TIMESTAMPTZ NOT NULL,
+            tp1_time TIMESTAMPTZ,
+            tp2_time TIMESTAMPTZ,
+            stop_time TIMESTAMPTZ,
+            runner_stop_time TIMESTAMPTZ,
+            manual_close_time TIMESTAMPTZ,
+            closed_at TIMESTAMPTZ,
+            events_done TEXT DEFAULT ''
+        );
+        """)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        db_pool = None
+
+
+async def db_insert_trade(trade: Trade) -> None:
+    if not db_pool:
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        INSERT INTO trades (
+            id, instrument, direction, entry, stop, tp1, tp2, lot, risk_gbp, risk_percent,
+            setup, quality, status, result, result_r, pnl_gbp, last_price, entry_time, events_done
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        trade.id, trade.instrument, trade.direction, trade.entry, trade.stop, trade.tp1, trade.tp2,
+        trade.lot, trade.risk_amount_gbp, trade.risk_percent, trade.setup, trade.quality, trade.status,
+        "OPEN", 0.0, 0.0, trade.last_price, trade.created_at, ",".join(sorted(trade.events_done))
+        )
+
+
+def trade_result_after_event(trade: Trade, event_key: str) -> tuple[str, float, float, bool]:
+    """Return result label, result in R, approximate GBP P/L, and whether trade is closed."""
+    risk = trade.risk_amount_gbp
+
+    if event_key == "TP1":
+        return "PARTIAL_TP1", 0.30, round_money(risk * 0.30), False
+
+    if event_key == "TP2":
+        return "RUNNER_ACTIVE", 0.90, round_money(risk * 0.90), False
+
+    if event_key == "STOP":
+        if "TP1" in trade.events_done:
+            return "STOP_AFTER_TP1", 0.30, round_money(risk * 0.30), True
+        return "LOSS", -1.00, round_money(-risk), True
+
+    if event_key == "RUNNER_STOP":
+        # TP1: 30% at +1R = +0.30R, TP2: 30% at +2R = +0.60R,
+        # runner: 40% stopped at TP1 = +0.40R, total ≈ +1.30R.
+        return "WIN_RUNNER_STOP", 1.30, round_money(risk * 1.30), True
+
+    if event_key == "MANUAL_CLOSE":
+        return "MANUAL_CLOSE", 0.0, 0.0, True
+
+    return "OPEN", 0.0, 0.0, False
+
+
+async def db_update_trade_event(trade: Trade, event_key: str, price: Optional[float] = None) -> None:
+    if not db_pool:
+        return
+
+    result, result_r, pnl_gbp, closed = trade_result_after_event(trade, event_key)
+    time_column = {
+        "TP1": "tp1_time",
+        "TP2": "tp2_time",
+        "STOP": "stop_time",
+        "RUNNER_STOP": "runner_stop_time",
+        "MANUAL_CLOSE": "manual_close_time",
+    }.get(event_key)
+
+    events_done_text = ",".join(sorted(trade.events_done))
+
+    async with db_pool.acquire() as conn:
+        if time_column:
+            await conn.execute(f"""
+            UPDATE trades
+            SET status=$1, result=$2, result_r=$3, pnl_gbp=$4, last_price=$5,
+                events_done=$6, {time_column}=NOW(), closed_at=CASE WHEN $7 THEN NOW() ELSE closed_at END
+            WHERE id=$8
+            """, trade.status, result, result_r, pnl_gbp, price, events_done_text, closed, trade.id)
+        else:
+            await conn.execute("""
+            UPDATE trades
+            SET status=$1, result=$2, result_r=$3, pnl_gbp=$4, last_price=$5, events_done=$6
+            WHERE id=$7
+            """, trade.status, result, result_r, pnl_gbp, price, events_done_text, trade.id)
+
+
+def row_to_dict(row) -> dict:
+    return dict(row) if row is not None else {}
 
 
 def validate_secret(secret: Optional[str]) -> None:
@@ -443,6 +585,82 @@ def list_trades() -> list[dict]:
     ]
 
 
+@app.get("/performance")
+async def performance() -> dict:
+    if not db_pool:
+        return {"ok": False, "error": "DATABASE_URL not configured or database not connected"}
+
+    async with db_pool.acquire() as conn:
+        summary = await conn.fetchrow("""
+        SELECT
+            COUNT(*)::INT AS total_trades,
+            COUNT(*) FILTER (WHERE result = 'LOSS')::INT AS losses,
+            COUNT(*) FILTER (WHERE result IN ('PARTIAL_TP1','STOP_AFTER_TP1','RUNNER_ACTIVE','WIN_RUNNER_STOP'))::INT AS trades_reached_tp1,
+            COUNT(*) FILTER (WHERE result IN ('RUNNER_ACTIVE','WIN_RUNNER_STOP'))::INT AS trades_reached_tp2,
+            COUNT(*) FILTER (WHERE result = 'WIN_RUNNER_STOP')::INT AS runner_wins,
+            COALESCE(SUM(pnl_gbp), 0)::DOUBLE PRECISION AS total_pnl_gbp,
+            COALESCE(AVG(result_r), 0)::DOUBLE PRECISION AS avg_r
+        FROM trades
+        """)
+
+        by_instrument = await conn.fetch("""
+        SELECT instrument, COUNT(*)::INT AS trades, COALESCE(SUM(pnl_gbp),0)::DOUBLE PRECISION AS pnl_gbp,
+               COALESCE(AVG(result_r),0)::DOUBLE PRECISION AS avg_r
+        FROM trades
+        GROUP BY instrument
+        ORDER BY instrument
+        """)
+
+        by_setup = await conn.fetch("""
+        SELECT setup, COUNT(*)::INT AS trades, COALESCE(SUM(pnl_gbp),0)::DOUBLE PRECISION AS pnl_gbp,
+               COALESCE(AVG(result_r),0)::DOUBLE PRECISION AS avg_r
+        FROM trades
+        GROUP BY setup
+        ORDER BY setup
+        """)
+
+        recent = await conn.fetch("""
+        SELECT id, instrument, direction, setup, quality, entry, stop, tp1, tp2, lot, risk_gbp,
+               status, result, result_r, pnl_gbp, entry_time, closed_at, events_done
+        FROM trades
+        ORDER BY entry_time DESC
+        LIMIT 20
+        """)
+
+    total = summary["total_trades"] or 0
+    tp1_rate = round(((summary["trades_reached_tp1"] or 0) / total) * 100, 2) if total else 0.0
+    tp2_rate = round(((summary["trades_reached_tp2"] or 0) / total) * 100, 2) if total else 0.0
+    loss_rate = round(((summary["losses"] or 0) / total) * 100, 2) if total else 0.0
+
+    return {
+        "ok": True,
+        "summary": {
+            **row_to_dict(summary),
+            "tp1_rate_percent": tp1_rate,
+            "tp2_rate_percent": tp2_rate,
+            "loss_rate_percent": loss_rate,
+        },
+        "by_instrument": [row_to_dict(r) for r in by_instrument],
+        "by_setup": [row_to_dict(r) for r in by_setup],
+        "recent_trades": [row_to_dict(r) for r in recent],
+    }
+
+
+@app.get("/performance/recent")
+async def performance_recent(limit: int = 50) -> dict:
+    if not db_pool:
+        return {"ok": False, "error": "DATABASE_URL not configured or database not connected"}
+
+    safe_limit = max(1, min(limit, 200))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+        SELECT * FROM trades
+        ORDER BY entry_time DESC
+        LIMIT $1
+        """, safe_limit)
+    return {"ok": True, "trades": [row_to_dict(r) for r in rows]}
+
+
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(alert: TradingViewAlert) -> dict:
     validate_secret(alert.secret)
@@ -503,6 +721,7 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
             fingerprint=fingerprint,
         )
         active_trades[trade.id] = trade
+        await db_insert_trade(trade)
 
         message = await claude_message("ENTRY_CREATED", trade, alert.current_price)
         await send_telegram(message)
@@ -539,6 +758,7 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
             if level_reached(trade.direction, current_price, active_stop, "STOP"):
                 if mark_event_once(trade, stop_event_key):
                     trade.status = "CLOSED" if trade.runner_active else "STOPPED"
+                    await db_update_trade_event(trade, stop_event_key, current_price)
                     message = await claude_message(stop_event_name, trade, current_price)
                     await send_telegram(message)
                     triggered_events.append({"trade_id": trade.id, "event": stop_event_key})
@@ -548,6 +768,7 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
                 if mark_event_once(trade, "TP1"):
                     trade.status = "TP1_DONE"
                     trade.runner_stop = round_price(trade.entry, trade.instrument)
+                    await db_update_trade_event(trade, "TP1", current_price)
                     message = await claude_message("TP1_REACHED", trade, current_price)
                     await send_telegram(message)
                     triggered_events.append({"trade_id": trade.id, "event": "TP1", "new_stop": trade.runner_stop})
@@ -557,6 +778,7 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
                     trade.status = "RUNNER"
                     trade.runner_active = True
                     trade.runner_stop = round_price(trade.tp1, trade.instrument)
+                    await db_update_trade_event(trade, "TP2", current_price)
                     message = await claude_message("TP2_REACHED", trade, current_price)
                     await send_telegram(message)
                     triggered_events.append({"trade_id": trade.id, "event": "TP2", "runner_stop": trade.runner_stop})
@@ -569,6 +791,7 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
             if trade.instrument == instrument and trade.status not in {"STOPPED", "CLOSED"}:
                 trade.status = "CLOSED"
                 trade.events_done.add("MANUAL_CLOSE")
+                await db_update_trade_event(trade, "MANUAL_CLOSE", alert.current_price)
                 closed.append(trade.id)
         return {"ok": True, "closed": closed}
 

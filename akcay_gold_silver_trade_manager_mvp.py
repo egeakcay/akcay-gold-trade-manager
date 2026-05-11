@@ -73,7 +73,8 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, Literal, Optional, Set
 
 import httpx
@@ -102,6 +103,10 @@ CAPITAL_GBP = float(os.getenv("CAPITAL_GBP", "5000"))
 # FIX 1: Minimum stop distance for SILVER to prevent unrealistically large position sizes.
 # e.g. risk=£50, price_risk=0.01 → lot=5000 — operationally dangerous.
 SILVER_MIN_STOP_DISTANCE = 0.05
+
+SESSION_FILTER_ENABLED = True
+UK_TZ = ZoneInfo("Europe/London")
+SessionPolicy = Literal["FULL_RISK", "HALF_RISK", "REJECT"]
 
 INSTRUMENT_CONFIG = {
     "GOLD": {
@@ -139,6 +144,8 @@ class TradingViewAlert(BaseModel):
     setup: Optional[str] = None
     quality: Optional[str] = None
     alert_id: Optional[str] = None
+    regime_score: Optional[float] = None
+    atr_expanding: Optional[float] = None
 
 
 @dataclass
@@ -155,6 +162,9 @@ class Trade:
     quality: str
     created_at: datetime
     fingerprint: str
+    session_name: str = "UNKNOWN"
+    session_policy: SessionPolicy = "FULL_RISK"
+    session_risk_multiplier: float = 1.0
     status: TradeStatus = "ACTIVE"
     tp1: float = 0.0
     tp2: float = 0.0
@@ -209,9 +219,17 @@ async def startup() -> None:
             runner_stop_time TIMESTAMPTZ,
             manual_close_time TIMESTAMPTZ,
             closed_at TIMESTAMPTZ,
-            events_done TEXT DEFAULT ''
+            events_done TEXT DEFAULT '',
+            session_name TEXT DEFAULT 'UNKNOWN',
+            session_policy TEXT DEFAULT 'FULL_RISK',
+            session_risk_multiplier DOUBLE PRECISION DEFAULT 1.0
         );
         """)
+
+        # Backfill session columns for existing tables created before this migration.
+        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_name TEXT DEFAULT 'UNKNOWN';")
+        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_policy TEXT DEFAULT 'FULL_RISK';")
+        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_risk_multiplier DOUBLE PRECISION DEFAULT 1.0;")
 
 
 @app.on_event("shutdown")
@@ -230,14 +248,16 @@ async def db_insert_trade(trade: Trade) -> None:
         await conn.execute("""
         INSERT INTO trades (
             id, instrument, direction, entry, stop, tp1, tp2, lot, risk_gbp, risk_percent,
-            setup, quality, status, result, result_r, pnl_gbp, last_price, entry_time, events_done
+            setup, quality, status, result, result_r, pnl_gbp, last_price, entry_time, events_done,
+            session_name, session_policy, session_risk_multiplier
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
         ON CONFLICT (id) DO NOTHING
         """,
         trade.id, trade.instrument, trade.direction, trade.entry, trade.stop, trade.tp1, trade.tp2,
         trade.lot, trade.risk_amount_gbp, trade.risk_percent, trade.setup, trade.quality, trade.status,
-        "OPEN", 0.0, 0.0, trade.last_price, trade.created_at, ",".join(sorted(trade.events_done))
+        "OPEN", 0.0, 0.0, trade.last_price, trade.created_at, ",".join(sorted(trade.events_done)),
+        trade.session_name, trade.session_policy, trade.session_risk_multiplier
         )
 
 
@@ -367,17 +387,65 @@ def calculate_levels(direction: Direction, entry: float, stop: float, instrument
     return round_price(entry - (risk * tp1_r), instrument), round_price(entry - (risk * tp2_r), instrument)
 
 
-def calculate_position_size(instrument: str, entry: float, stop: float, setup: Optional[str]) -> tuple[float, float, float]:
+def time_in_range(current: time, start: time, end: time) -> bool:
+    """Return True if current UK time is inside [start, end). Supports overnight ranges."""
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def get_session_policy(instrument: str, direction: Optional[Direction], now_uk: Optional[datetime] = None) -> tuple[SessionPolicy, str, float]:
+    """
+    Production session policy based on observed performance logs.
+    GOLD:
+      03:00–06:00 UK → FULL_RISK
+      06:00–13:00 UK → HALF_RISK
+      13:00–03:00 UK → REJECT
+    SILVER:
+      06:00–16:30 UK → FULL_RISK
+      21:00–24:00 UK → FULL_RISK
+      00:00–06:00 UK → REJECT
+      16:30–21:00 UK → REJECT
+      Extra: SILVER SELL 08:00–12:00 UK → REJECT
+    """
+    if not SESSION_FILTER_ENABLED:
+        return "FULL_RISK", "SESSION_FILTER_DISABLED", 1.0
+    symbol = instrument.upper()
+    now = now_uk or datetime.now(UK_TZ)
+    t = now.time()
+    if symbol == "GOLD":
+        if time_in_range(t, time(3, 0), time(6, 0)):
+            return "FULL_RISK", "GOLD_0300_0600_FULL", 1.0
+        if time_in_range(t, time(6, 0), time(13, 0)):
+            return "HALF_RISK", "GOLD_0600_1300_HALF", 0.5
+        return "REJECT", "GOLD_1300_0300_REJECT", 0.0
+    if symbol == "SILVER":
+        if direction == "SELL" and time_in_range(t, time(8, 0), time(12, 0)):
+            return "REJECT", "SILVER_SELL_0800_1200_REJECT", 0.0
+        if time_in_range(t, time(6, 0), time(16, 30)):
+            return "FULL_RISK", "SILVER_0600_1630_FULL", 1.0
+        if time_in_range(t, time(21, 0), time(0, 0)):
+            return "FULL_RISK", "SILVER_2100_2400_FULL", 1.0
+        return "REJECT", "SILVER_OUTSIDE_ALLOWED_REJECT", 0.0
+    return "FULL_RISK", "UNKNOWN_INSTRUMENT_DEFAULT", 1.0
+
+
+def calculate_position_size(
+    instrument: str,
+    entry: float,
+    stop: float,
+    setup: Optional[str],
+    session_risk_multiplier: float = 1.0,
+) -> tuple[float, float, float]:
     config = get_config(instrument)
     price_risk = abs(entry - stop)
     if price_risk <= 0:
         raise ValueError("Stop must be different from entry")
-
     base_risk_percent = float(config["risk_per_trade"])
     effective_risk_percent = base_risk_percent * float(config["bo_risk_multiplier"]) if is_bo_setup(setup) else base_risk_percent
+    effective_risk_percent = effective_risk_percent * session_risk_multiplier
     risk_amount_gbp = float(config["capital_gbp"]) * effective_risk_percent
-    lot = risk_amount_gbp / price_risk
-
+    lot = risk_amount_gbp / price_risk if price_risk > 0 else 0.0
     return round_lot(lot), round_money(risk_amount_gbp), round(effective_risk_percent * 100, 2)
 
 
@@ -476,6 +544,27 @@ Create a concise Telegram notification.
         return fallback
 
 
+async def send_session_reject_message(
+    instrument: str,
+    direction: Optional[str],
+    setup: Optional[str],
+    quality: Optional[str],
+    entry: Optional[float],
+    stop: Optional[float],
+    session_name: str,
+) -> None:
+    msg = (
+        f"{instrument} {direction or 'UNKNOWN'} trade rejected by session filter\n"
+        f"Setup: {setup or 'UNKNOWN'} | Quality: {quality or 'UNKNOWN'}\n"
+        f"Session: {session_name}\n"
+        f"Entry: {entry}\n"
+        f"Stop: {stop}\n"
+        f"No trade was created."
+    )
+    print(f"SESSION_FILTER_REJECT | {instrument} | {direction} | {setup} | {session_name}")
+    await send_telegram(msg)
+
+
 def format_fallback_message(event_name: str, trade: Trade, price: Optional[float]) -> str:
     if event_name == "ENTRY_CREATED":
         return (
@@ -485,6 +574,7 @@ def format_fallback_message(event_name: str, trade: Trade, price: Optional[float
             f"Entry: {trade.entry}\n"
             f"Stop: {trade.stop}\n"
             f"Risk: £{trade.risk_amount_gbp} ({trade.risk_percent}%)\n"
+            f"Session: {trade.session_name} | Policy: {trade.session_policy}\n"
             f"Lot/Units: {trade.lot}\n"
             f"TP1: {trade.tp1} → close 30% manually\n"
             f"TP2: {trade.tp2} → close 30% manually\n"
@@ -554,7 +644,14 @@ def root() -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "active_trades": len(active_trades), "capital_gbp": CAPITAL_GBP}
+    now_uk = datetime.now(UK_TZ)
+    return {
+        "status": "ok",
+        "active_trades": len(active_trades),
+        "capital_gbp": CAPITAL_GBP,
+        "session_filter_enabled": SESSION_FILTER_ENABLED,
+        "uk_time": now_uk.isoformat(),
+    }
 
 
 @app.get("/trades")
@@ -580,6 +677,9 @@ def list_trades() -> list[dict]:
             "created_at": t.created_at.isoformat(),
             "events_done": sorted(t.events_done),
             "fingerprint": t.fingerprint,
+            "session_name": t.session_name,
+            "session_policy": t.session_policy,
+            "session_risk_multiplier": t.session_risk_multiplier,
         }
         for t in active_trades.values()
     ]
@@ -619,9 +719,28 @@ async def performance() -> dict:
         ORDER BY setup
         """)
 
+        by_session = await conn.fetch("""
+        SELECT session_name, COUNT(*)::INT AS trades, COALESCE(SUM(pnl_gbp),0)::DOUBLE PRECISION AS pnl_gbp,
+               COALESCE(AVG(result_r),0)::DOUBLE PRECISION AS avg_r,
+               COUNT(*) FILTER (WHERE result = 'LOSS')::INT AS losses,
+               COUNT(*) FILTER (WHERE result IN ('PARTIAL_TP1','STOP_AFTER_TP1','RUNNER_ACTIVE','WIN_RUNNER_STOP'))::INT AS trades_reached_tp1
+        FROM trades
+        GROUP BY session_name
+        ORDER BY session_name
+        """)
+
+        by_session_policy = await conn.fetch("""
+        SELECT session_policy, COUNT(*)::INT AS trades, COALESCE(SUM(pnl_gbp),0)::DOUBLE PRECISION AS pnl_gbp,
+               COALESCE(AVG(result_r),0)::DOUBLE PRECISION AS avg_r
+        FROM trades
+        GROUP BY session_policy
+        ORDER BY session_policy
+        """)
+
         recent = await conn.fetch("""
         SELECT id, instrument, direction, setup, quality, entry, stop, tp1, tp2, lot, risk_gbp,
-               status, result, result_r, pnl_gbp, entry_time, closed_at, events_done
+               status, result, result_r, pnl_gbp, entry_time, closed_at, events_done,
+               session_name, session_policy, session_risk_multiplier
         FROM trades
         ORDER BY entry_time DESC
         LIMIT 20
@@ -642,6 +761,8 @@ async def performance() -> dict:
         },
         "by_instrument": [row_to_dict(r) for r in by_instrument],
         "by_setup": [row_to_dict(r) for r in by_setup],
+        "by_session": [row_to_dict(r) for r in by_session],
+        "by_session_policy": [row_to_dict(r) for r in by_session_policy],
         "recent_trades": [row_to_dict(r) for r in recent],
     }
 
@@ -681,6 +802,25 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
         entry = round_price(alert.entry, instrument)
         computed_stop = round_price(computed_stop, instrument)
 
+        session_policy, session_name, session_risk_multiplier = get_session_policy(instrument, alert.direction)
+        if session_policy == "REJECT":
+            await send_session_reject_message(
+                instrument=instrument,
+                direction=alert.direction,
+                setup=alert.setup,
+                quality=alert.quality,
+                entry=entry,
+                stop=computed_stop,
+                session_name=session_name,
+            )
+            return {
+                "ok": False,
+                "rejected": True,
+                "reason": "SESSION_FILTER",
+                "session_name": session_name,
+                "session_policy": session_policy,
+            }
+
         # FIX 1: SILVER minimum stop distance guard.
         # Prevents unrealistically large position sizes from tight stops.
         if instrument == "SILVER" and abs(entry - computed_stop) < SILVER_MIN_STOP_DISTANCE:
@@ -701,7 +841,13 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
                 return {"ok": True, "duplicate_ignored": True, "trade_id": existing_trade.id}
 
         tp1, tp2 = calculate_levels(alert.direction, entry, computed_stop, instrument)
-        lot, risk_amount_gbp, risk_percent = calculate_position_size(instrument, entry, computed_stop, alert.setup)
+        lot, risk_amount_gbp, risk_percent = calculate_position_size(
+            instrument,
+            entry,
+            computed_stop,
+            alert.setup,
+            session_risk_multiplier=session_risk_multiplier,
+        )
 
         trade = Trade(
             id=str(uuid.uuid4())[:8],
@@ -719,6 +865,9 @@ async def tradingview_webhook(alert: TradingViewAlert) -> dict:
             tp2=tp2,
             last_price=alert.current_price,
             fingerprint=fingerprint,
+            session_name=session_name,
+            session_policy=session_policy,
+            session_risk_multiplier=session_risk_multiplier,
         )
         active_trades[trade.id] = trade
         await db_insert_trade(trade)

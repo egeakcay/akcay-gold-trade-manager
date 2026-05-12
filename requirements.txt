@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-httpx
 pydantic
 python-dotenv
-asyncpg
+requests

@@ -1,6 +1,4 @@
 # railway_main_htf_mvp_v3.py
-# Production-safe MVP execution version
-# TradingView webhook -> Railway -> filter/log -> Telegram -> /trades -> MT5 executor
 
 import os
 import json
@@ -11,7 +9,7 @@ from typing import Optional, List, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # =============================================================
 # ENV / CONFIG
@@ -23,19 +21,24 @@ ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SESSION_FILTER_ENABLED = os.getenv("SESSION_FILTER_ENABLED", "true").lower() == "true"
+SESSION_FILTER_ENABLED = os.getenv("SESSION_FILTER_ENABLED", "false").lower() == "true"
 ENABLE_HTF_GATE = os.getenv("ENABLE_HTF_GATE", "true").lower() == "true"
 ENABLE_CONFIDENCE_GATE = os.getenv("ENABLE_CONFIDENCE_GATE", "false").lower() == "true"
 REJECT_LOW_CONFIDENCE = os.getenv("REJECT_LOW_CONFIDENCE", "false").lower() == "true"
 
 CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "60"))
 DAILY_TRADE_LIMIT = int(os.getenv("DAILY_TRADE_LIMIT", "10"))
+
 ACCOUNT_BALANCE_GBP = float(os.getenv("ACCOUNT_BALANCE_GBP", "10000"))
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2"))
+
+GOLD_MIN_STOP_DISTANCE = float(os.getenv("GOLD_MIN_STOP_DISTANCE", "40"))
+SILVER_MIN_STOP_DISTANCE = float(os.getenv("SILVER_MIN_STOP_DISTANCE", "0.45"))
+GOLD_TP_R = float(os.getenv("GOLD_TP_R", "1.5"))
+SILVER_TP_R = float(os.getenv("SILVER_TP_R", "1.2"))
 
 DUPLICATE_WINDOW_MINUTES = int(os.getenv("DUPLICATE_WINDOW_MINUTES", "15"))
 
-# HTF state codes
 HTF_STATE_MAP = {
     0: "BEARISH_ONLY",
     1: "BULLISH_ONLY",
@@ -43,10 +46,13 @@ HTF_STATE_MAP = {
     3: "BOTH_ALLOWED",
 }
 
+GOLD_SYMBOLS = {"XAUUSD", "GOLD", "XAU/USD", "XAU_USD", "XAUUSDM", "XAUUSDC"}
+SILVER_SYMBOLS = {"XAGUSD", "SILVER", "XAG/USD", "XAG_USD", "XAGUSDM", "XAGUSDC"}
+
 # =============================================================
 # APP
 # =============================================================
-app = FastAPI(title="HTF MVP v3", version="3.0.0")
+app = FastAPI(title="HTF MVP v3", version="3.1.0")
 
 
 # =============================================================
@@ -77,6 +83,35 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def make_trade_uid(instrument: str, direction: str, entry: float, setup: str) -> str:
     raw = f"{instrument}|{direction}|{round(entry, 5)}|{setup}|{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+def classify_instrument(instrument: str) -> str:
+    if not instrument:
+        return "OTHER"
+    sym = instrument.upper().replace(" ", "")
+    if sym in GOLD_SYMBOLS or "XAUUSD" in sym or sym.startswith("XAU"):
+        return "GOLD"
+    if sym in SILVER_SYMBOLS or "XAGUSD" in sym or sym.startswith("XAG"):
+        return "SILVER"
+    return "OTHER"
+
+
+def get_min_stop_distance(instrument: str) -> Optional[float]:
+    kind = classify_instrument(instrument)
+    if kind == "GOLD":
+        return GOLD_MIN_STOP_DISTANCE
+    if kind == "SILVER":
+        return SILVER_MIN_STOP_DISTANCE
+    return None
+
+
+def get_tp_r(instrument: str) -> Optional[float]:
+    kind = classify_instrument(instrument)
+    if kind == "GOLD":
+        return GOLD_TP_R
+    if kind == "SILVER":
+        return SILVER_TP_R
+    return None
 
 
 # =============================================================
@@ -116,7 +151,11 @@ def init_db():
             entry REAL,
             stop REAL,
             tp REAL,
+            original_stop REAL,
+            original_tp REAL,
+            stop_adjusted INTEGER DEFAULT 0,
             current_price REAL,
+            risk_amount_gbp REAL,
             raw_payload TEXT,
             telegram_sent INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
@@ -132,6 +171,9 @@ def init_db():
             entry REAL,
             stop REAL,
             tp REAL,
+            original_stop REAL,
+            original_tp REAL,
+            stop_adjusted INTEGER DEFAULT 0,
             current_price REAL,
             setup TEXT,
             quality TEXT,
@@ -190,11 +232,24 @@ def migrate_db():
     add_column_if_missing("signals", "entry", "REAL")
     add_column_if_missing("signals", "stop", "REAL")
     add_column_if_missing("signals", "tp", "REAL")
+    add_column_if_missing("signals", "original_stop", "REAL")
+    add_column_if_missing("signals", "original_tp", "REAL")
+    add_column_if_missing("signals", "stop_adjusted", "INTEGER DEFAULT 0")
     add_column_if_missing("signals", "current_price", "REAL")
+    add_column_if_missing("signals", "risk_amount_gbp", "REAL")
     add_column_if_missing("signals", "raw_payload", "TEXT")
     add_column_if_missing("signals", "telegram_sent", "INTEGER DEFAULT 0")
 
     # trades
+    add_column_if_missing("trades", "trade_uid", "TEXT")
+    add_column_if_missing("trades", "instrument", "TEXT")
+    add_column_if_missing("trades", "direction", "TEXT")
+    add_column_if_missing("trades", "entry", "REAL")
+    add_column_if_missing("trades", "stop", "REAL")
+    add_column_if_missing("trades", "tp", "REAL")
+    add_column_if_missing("trades", "original_stop", "REAL")
+    add_column_if_missing("trades", "original_tp", "REAL")
+    add_column_if_missing("trades", "stop_adjusted", "INTEGER DEFAULT 0")
     add_column_if_missing("trades", "current_price", "REAL")
     add_column_if_missing("trades", "setup", "TEXT")
     add_column_if_missing("trades", "quality", "TEXT")
@@ -272,17 +327,26 @@ def telegram_trade_message(
     session_quality: str,
     confidence_score: Optional[int],
     confidence_mode: Optional[str],
+    final_stop: Optional[float] = None,
+    final_tp: Optional[float] = None,
+    stop_adjusted: bool = False,
+    risk_amount_gbp: Optional[float] = None,
 ) -> str:
     emoji = "✅" if decision == "ACTIVE" else "❌"
+    stop_to_show = final_stop if final_stop is not None else payload.stop
+    tp_to_show = final_tp if final_tp is not None else payload.tp
+    adj_tag = " (ADJ)" if stop_adjusted else ""
     lines = [
         f"{emoji} {decision} — {payload.instrument} {payload.direction}",
         f"Setup: {payload.setup} | Quality: {payload.quality}",
-        f"Entry: {payload.entry} | SL: {payload.stop} | TP: {payload.tp}",
+        f"Entry: {payload.entry} | SL: {stop_to_show}{adj_tag} | TP: {tp_to_show}{adj_tag}",
         f"HTF: {htf_state} | Session: {session_quality}",
         f"Confidence: {confidence_score} ({confidence_mode})",
-        f"Reason: {reason}",
-        f"Time: {now()}",
     ]
+    if risk_amount_gbp is not None:
+        lines.append(f"Risk: £{risk_amount_gbp}")
+    lines.append(f"Reason: {reason}")
+    lines.append(f"Time: {now()}")
     return "\n".join(lines)
 
 
@@ -290,13 +354,10 @@ def telegram_trade_message(
 # FILTERS
 # =============================================================
 def evaluate_session(instrument: str) -> (str, str):
-    """Returns (session_quality, session_reason)."""
     if not SESSION_FILTER_ENABLED:
         return "BYPASSED", "SESSION_FILTER_DISABLED"
 
     utc_hour = datetime.now(timezone.utc).hour
-
-    # London 7-16 UTC, NY 12-21 UTC, overlap 12-16 UTC = best
     if 12 <= utc_hour < 16:
         return "PRIME", "LONDON_NY_OVERLAP"
     if 7 <= utc_hour < 12:
@@ -315,7 +376,6 @@ def session_allows_trade(session_quality: str) -> bool:
 
 
 def evaluate_htf(direction: str, htf_state_code: int) -> (bool, str, str):
-    """Returns (allowed, htf_state_name, reason)."""
     state_name = HTF_STATE_MAP.get(htf_state_code, "BOTH_ALLOWED")
 
     if not ENABLE_HTF_GATE:
@@ -327,11 +387,15 @@ def evaluate_htf(direction: str, htf_state_code: int) -> (bool, str, str):
         return True, state_name, "BOTH_ALLOWED"
     if htf_state_code == 2:
         return False, state_name, "HTF_NEUTRAL_BLOCKED"
-    if htf_state_code == 1 and direction_upper in ("BUY", "LONG"):
-        return True, state_name, "HTF_BULLISH_ALIGNED"
-    if htf_state_code == 0 and direction_upper in ("SELL", "SHORT"):
-        return True, state_name, "HTF_BEARISH_ALIGNED"
-    return False, state_name, "HTF_CONFLICT"
+    if htf_state_code == 1:
+        if direction_upper in ("BUY", "LONG"):
+            return True, state_name, "HTF_BULLISH_ALIGNED"
+        return False, state_name, "HTF_CONFLICT_SELL_VS_BULLISH"
+    if htf_state_code == 0:
+        if direction_upper in ("SELL", "SHORT"):
+            return True, state_name, "HTF_BEARISH_ALIGNED"
+        return False, state_name, "HTF_CONFLICT_BUY_VS_BEARISH"
+    return True, state_name, "HTF_UNKNOWN_DEFAULT_ALLOW"
 
 
 def compute_confidence(payload: EntryPayload, session_quality: str, htf_aligned: bool) -> (int, str, List[str]):
@@ -383,6 +447,76 @@ def compute_confidence(payload: EntryPayload, session_quality: str, htf_aligned:
     return min(score, 100), mode, reasons
 
 
+def adjust_stop_and_tp(
+    instrument: str,
+    direction: str,
+    entry: float,
+    pine_stop: float,
+    pine_tp: float,
+) -> dict:
+    """
+    Enforce minimum SL distance.
+    If Pine stop is closer than minimum, widen it and recalc TP at R multiple.
+    If Pine stop is already wider than or equal to minimum, keep Pine stop and TP as-is.
+    """
+    direction_upper = (direction or "").upper()
+    is_buy = direction_upper in ("BUY", "LONG")
+
+    min_distance = get_min_stop_distance(instrument)
+    tp_r = get_tp_r(instrument)
+
+    pine_stop_distance = abs(entry - pine_stop)
+
+    # Non gold/silver instruments: leave untouched
+    if min_distance is None or tp_r is None:
+        return {
+            "final_stop": pine_stop,
+            "final_tp": pine_tp,
+            "original_stop": pine_stop,
+            "original_tp": pine_tp,
+            "stop_adjusted": False,
+            "stop_distance": pine_stop_distance,
+            "tp_r_used": None,
+        }
+
+    if pine_stop_distance >= min_distance:
+        return {
+            "final_stop": pine_stop,
+            "final_tp": pine_tp,
+            "original_stop": pine_stop,
+            "original_tp": pine_tp,
+            "stop_adjusted": False,
+            "stop_distance": pine_stop_distance,
+            "tp_r_used": tp_r,
+        }
+
+    # Pine stop too tight -> widen and recalc TP
+    if is_buy:
+        new_stop = entry - min_distance
+        new_tp = entry + (min_distance * tp_r)
+    else:
+        new_stop = entry + min_distance
+        new_tp = entry - (min_distance * tp_r)
+
+    # Round sanely
+    if classify_instrument(instrument) == "GOLD":
+        new_stop = round(new_stop, 2)
+        new_tp = round(new_tp, 2)
+    else:
+        new_stop = round(new_stop, 3)
+        new_tp = round(new_tp, 3)
+
+    return {
+        "final_stop": new_stop,
+        "final_tp": new_tp,
+        "original_stop": pine_stop,
+        "original_tp": pine_tp,
+        "stop_adjusted": True,
+        "stop_distance": min_distance,
+        "tp_r_used": tp_r,
+    }
+
+
 def is_duplicate(trade_uid: str, instrument: str, direction: str, entry: float) -> bool:
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)).isoformat()
     con = db()
@@ -426,6 +560,12 @@ def log_signal(
     confidence_score: Optional[int],
     confidence_mode: Optional[str],
     confidence_reasons: Optional[List[str]],
+    final_stop: Optional[float],
+    final_tp: Optional[float],
+    original_stop: Optional[float],
+    original_tp: Optional[float],
+    stop_adjusted: bool,
+    risk_amount_gbp: Optional[float],
     telegram_sent: bool = False,
 ):
     raw_payload = payload.model_dump_json()
@@ -437,8 +577,9 @@ def log_signal(
          session_quality, session_reason, regime_score, atr_expanding,
          htf_tf, htf_state_code, htf_state, htf_score,
          confidence_score, confidence_mode, confidence_reasons,
-         entry, stop, tp, current_price, raw_payload, telegram_sent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         entry, stop, tp, original_stop, original_tp, stop_adjusted,
+         current_price, risk_amount_gbp, raw_payload, telegram_sent, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trade_uid,
         payload.instrument,
@@ -459,9 +600,13 @@ def log_signal(
         confidence_mode,
         json.dumps(confidence_reasons or []),
         safe_float(payload.entry),
-        safe_float(payload.stop),
-        safe_float(payload.tp),
+        safe_float(final_stop if final_stop is not None else payload.stop),
+        safe_float(final_tp if final_tp is not None else payload.tp),
+        safe_float(original_stop if original_stop is not None else payload.stop),
+        safe_float(original_tp if original_tp is not None else payload.tp),
+        1 if stop_adjusted else 0,
         safe_float(payload.current_price if payload.current_price is not None else payload.entry),
+        risk_amount_gbp,
         raw_payload,
         1 if telegram_sent else 0,
         now(),
@@ -480,6 +625,11 @@ def save_trade(
     confidence_score: int,
     confidence_mode: str,
     risk_amount_gbp: float,
+    final_stop: float,
+    final_tp: float,
+    original_stop: float,
+    original_tp: float,
+    stop_adjusted: bool,
     session_reason: Optional[str] = None,
     confidence_reasons: Optional[List[str]] = None,
 ):
@@ -488,19 +638,23 @@ def save_trade(
     cur = con.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO trades
-        (trade_uid, instrument, direction, entry, stop, tp, current_price,
+        (trade_uid, instrument, direction, entry, stop, tp,
+         original_stop, original_tp, stop_adjusted, current_price,
          setup, quality, regime_score, atr_expanding, htf_tf, htf_state_code,
          htf_state, htf_score, session_quality, session_reason,
          confidence_score, confidence_mode, confidence_reasons, raw_payload,
          risk_amount_gbp, status, reason, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trade_uid,
         payload.instrument,
         payload.direction,
         safe_float(payload.entry),
-        safe_float(payload.stop),
-        safe_float(payload.tp),
+        safe_float(final_stop),
+        safe_float(final_tp),
+        safe_float(original_stop),
+        safe_float(original_tp),
+        1 if stop_adjusted else 0,
         safe_float(payload.current_price if payload.current_price is not None else payload.entry),
         payload.setup,
         payload.quality,
@@ -533,7 +687,37 @@ def entry_webhook(payload: EntryPayload) -> dict:
     if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="invalid secret")
 
-    # Normalize defaults
+    # Validation
+    try:
+        if payload.entry <= 0 or payload.stop <= 0 or payload.tp <= 0:
+            raise ValueError("entry/stop/tp must be > 0")
+        if (payload.direction or "").upper() not in ("BUY", "SELL", "LONG", "SHORT"):
+            raise ValueError("invalid direction")
+    except Exception as exc:
+        reason = f"VALIDATION_ERROR:{exc}"
+        log_signal(
+            trade_uid=make_trade_uid(payload.instrument or "UNKNOWN", payload.direction or "NA",
+                                     safe_float(payload.entry), payload.setup or "default"),
+            payload=payload,
+            decision="VALIDATION_ERROR",
+            reason=reason,
+            htf_state=HTF_STATE_MAP.get(safe_int(payload.htf_state_code, 3), "BOTH_ALLOWED"),
+            session_quality="UNKNOWN",
+            session_reason="VALIDATION_FAIL",
+            confidence_score=None,
+            confidence_mode=None,
+            confidence_reasons=[],
+            final_stop=safe_float(payload.stop),
+            final_tp=safe_float(payload.tp),
+            original_stop=safe_float(payload.stop),
+            original_tp=safe_float(payload.tp),
+            stop_adjusted=False,
+            risk_amount_gbp=None,
+            telegram_sent=False,
+        )
+        return {"status": "VALIDATION_ERROR", "reason": reason}
+
+    # Defaults
     if payload.htf_state_code is None:
         payload.htf_state_code = 3
     if payload.htf_score is None:
@@ -544,11 +728,29 @@ def entry_webhook(payload: EntryPayload) -> dict:
     trade_uid = make_trade_uid(payload.instrument, payload.direction, payload.entry, payload.setup or "default")
     htf_state_name = HTF_STATE_MAP.get(safe_int(payload.htf_state_code, 3), "BOTH_ALLOWED")
 
-    # ---------- 1. DUPLICATE CHECK ----------
+    # ---------- ADJUST STOP/TP ----------
+    adj = adjust_stop_and_tp(
+        instrument=payload.instrument,
+        direction=payload.direction,
+        entry=safe_float(payload.entry),
+        pine_stop=safe_float(payload.stop),
+        pine_tp=safe_float(payload.tp),
+    )
+    final_stop = adj["final_stop"]
+    final_tp = adj["final_tp"]
+    original_stop = adj["original_stop"]
+    original_tp = adj["original_tp"]
+    stop_adjusted = adj["stop_adjusted"]
+
+    # ---------- RISK AMOUNT ----------
+    risk_amount_gbp = round(ACCOUNT_BALANCE_GBP * (RISK_PER_TRADE_PCT / 100.0), 2)
+
+    # ---------- 1. DUPLICATE ----------
     if is_duplicate(trade_uid, payload.instrument, payload.direction, payload.entry):
         reason = "DUPLICATE_SIGNAL"
         telegram_sent = send_telegram(
-            telegram_trade_message(payload, "DUPLICATE", reason, htf_state_name, "UNKNOWN", None, None)
+            telegram_trade_message(payload, "DUPLICATE", reason, htf_state_name, "UNKNOWN",
+                                   None, None, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
         )
         log_signal(
             trade_uid=trade_uid,
@@ -561,6 +763,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=None,
             confidence_mode=None,
             confidence_reasons=[],
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
+            risk_amount_gbp=risk_amount_gbp,
             telegram_sent=telegram_sent,
         )
         return {"status": "DUPLICATE", "trade_uid": trade_uid, "reason": reason}
@@ -578,12 +786,13 @@ def entry_webhook(payload: EntryPayload) -> dict:
     if not session_allows_trade(session_quality):
         reason = f"SESSION_FILTER:{session_reason}"
         telegram_sent = send_telegram(
-            telegram_trade_message(payload, "SESSION_FILTER", reason, htf_state_name, session_quality, score, mode)
+            telegram_trade_message(payload, "REJECTED", reason, htf_state_name, session_quality,
+                                   score, mode, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
         )
         log_signal(
             trade_uid=trade_uid,
             payload=payload,
-            decision="SESSION_FILTER",
+            decision="REJECTED",
             reason=reason,
             htf_state=htf_state_name,
             session_quality=session_quality,
@@ -591,15 +800,22 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=score,
             confidence_mode=mode,
             confidence_reasons=score_reasons,
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
+            risk_amount_gbp=risk_amount_gbp,
             telegram_sent=telegram_sent,
         )
-        return {"status": "SESSION_FILTER", "trade_uid": trade_uid, "reason": reason}
+        return {"status": "REJECTED", "trade_uid": trade_uid, "reason": reason}
 
     # ---------- 6. HTF GATE ----------
     if not htf_allowed:
         reason = f"HTF_CONFLICT:{htf_reason}"
         telegram_sent = send_telegram(
-            telegram_trade_message(payload, "HTF_CONFLICT", reason, htf_state_name, session_quality, score, mode)
+            telegram_trade_message(payload, "HTF_CONFLICT", reason, htf_state_name, session_quality,
+                                   score, mode, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
         )
         log_signal(
             trade_uid=trade_uid,
@@ -612,6 +828,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=score,
             confidence_mode=mode,
             confidence_reasons=score_reasons,
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
+            risk_amount_gbp=risk_amount_gbp,
             telegram_sent=telegram_sent,
         )
         return {"status": "HTF_CONFLICT", "trade_uid": trade_uid, "reason": reason}
@@ -621,7 +843,8 @@ def entry_webhook(payload: EntryPayload) -> dict:
     if todays >= DAILY_TRADE_LIMIT:
         reason = f"DAILY_LIMIT_REACHED:{todays}/{DAILY_TRADE_LIMIT}"
         telegram_sent = send_telegram(
-            telegram_trade_message(payload, "DAILY_LIMIT", reason, htf_state_name, session_quality, score, mode)
+            telegram_trade_message(payload, "DAILY_LIMIT", reason, htf_state_name, session_quality,
+                                   score, mode, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
         )
         log_signal(
             trade_uid=trade_uid,
@@ -634,6 +857,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=score,
             confidence_mode=mode,
             confidence_reasons=score_reasons,
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
+            risk_amount_gbp=risk_amount_gbp,
             telegram_sent=telegram_sent,
         )
         return {"status": "DAILY_LIMIT", "trade_uid": trade_uid, "reason": reason}
@@ -642,7 +871,8 @@ def entry_webhook(payload: EntryPayload) -> dict:
     if ENABLE_CONFIDENCE_GATE and REJECT_LOW_CONFIDENCE and score < CONFIDENCE_MIN:
         reason = f"LOW_CONFIDENCE:{score}<{CONFIDENCE_MIN}"
         telegram_sent = send_telegram(
-            telegram_trade_message(payload, "LOW_CONFIDENCE", reason, htf_state_name, session_quality, score, mode)
+            telegram_trade_message(payload, "LOW_CONFIDENCE", reason, htf_state_name, session_quality,
+                                   score, mode, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
         )
         log_signal(
             trade_uid=trade_uid,
@@ -655,6 +885,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=score,
             confidence_mode=mode,
             confidence_reasons=score_reasons,
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
+            risk_amount_gbp=risk_amount_gbp,
             telegram_sent=telegram_sent,
         )
         save_trade(
@@ -667,17 +903,24 @@ def entry_webhook(payload: EntryPayload) -> dict:
             confidence_score=score,
             confidence_mode=mode,
             risk_amount_gbp=0.0,
+            final_stop=final_stop,
+            final_tp=final_tp,
+            original_stop=original_stop,
+            original_tp=original_tp,
+            stop_adjusted=stop_adjusted,
             session_reason=session_reason,
             confidence_reasons=score_reasons,
         )
         return {"status": "LOW_CONFIDENCE", "trade_uid": trade_uid, "reason": reason}
 
     # ---------- 9. ACTIVE ----------
-    risk_amount = round(ACCOUNT_BALANCE_GBP * (RISK_PER_TRADE_PCT / 100.0), 2)
     reason = "ALL_FILTERS_PASSED"
+    if stop_adjusted:
+        reason += "|STOP_ADJUSTED_TO_MIN_DISTANCE"
 
     telegram_sent = send_telegram(
-        telegram_trade_message(payload, "ACTIVE", reason, htf_state_name, session_quality, score, mode)
+        telegram_trade_message(payload, "ACTIVE", reason, htf_state_name, session_quality,
+                               score, mode, final_stop, final_tp, stop_adjusted, risk_amount_gbp)
     )
     log_signal(
         trade_uid=trade_uid,
@@ -690,6 +933,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
         confidence_score=score,
         confidence_mode=mode,
         confidence_reasons=score_reasons,
+        final_stop=final_stop,
+        final_tp=final_tp,
+        original_stop=original_stop,
+        original_tp=original_tp,
+        stop_adjusted=stop_adjusted,
+        risk_amount_gbp=risk_amount_gbp,
         telegram_sent=telegram_sent,
     )
     save_trade(
@@ -701,7 +950,12 @@ def entry_webhook(payload: EntryPayload) -> dict:
         session_quality=session_quality,
         confidence_score=score,
         confidence_mode=mode,
-        risk_amount_gbp=risk_amount,
+        risk_amount_gbp=risk_amount_gbp,
+        final_stop=final_stop,
+        final_tp=final_tp,
+        original_stop=original_stop,
+        original_tp=original_tp,
+        stop_adjusted=stop_adjusted,
         session_reason=session_reason,
         confidence_reasons=score_reasons,
     )
@@ -713,14 +967,18 @@ def entry_webhook(payload: EntryPayload) -> dict:
         "instrument": payload.instrument,
         "direction": payload.direction,
         "entry": payload.entry,
-        "stop": payload.stop,
-        "tp": payload.tp,
+        "stop": final_stop,
+        "tp": final_tp,
+        "original_stop": original_stop,
+        "original_tp": original_tp,
+        "stop_adjusted": stop_adjusted,
         "current_price": payload.current_price,
         "htf_state": htf_state_name,
         "session_quality": session_quality,
+        "session_reason": session_reason,
         "confidence_score": score,
         "confidence_mode": mode,
-        "risk_amount_gbp": risk_amount,
+        "risk_amount_gbp": risk_amount_gbp,
     }
 
 
@@ -744,7 +1002,10 @@ def health():
         "session_filter_enabled": SESSION_FILTER_ENABLED,
         "account_balance_gbp": ACCOUNT_BALANCE_GBP,
         "risk_per_trade_pct": RISK_PER_TRADE_PCT,
-        "default_risk_gbp": DEFAULT_RISK_GBP,
+        "gold_min_stop_distance": GOLD_MIN_STOP_DISTANCE,
+        "silver_min_stop_distance": SILVER_MIN_STOP_DISTANCE,
+        "gold_tp_r": GOLD_TP_R,
+        "silver_tp_r": SILVER_TP_R,
     }
 
 
@@ -800,7 +1061,7 @@ def get_rejected_signals(limit: int = 100):
     cur = con.cursor()
     cur.execute("""
         SELECT * FROM signals
-        WHERE decision IN ('REJECTED','SESSION_FILTER','HTF_CONFLICT','DAILY_LIMIT','LOW_CONFIDENCE','DUPLICATE')
+        WHERE decision IN ('REJECTED','HTF_CONFLICT','DAILY_LIMIT','LOW_CONFIDENCE','DUPLICATE','VALIDATION_ERROR')
         ORDER BY id DESC
         LIMIT ?
     """, (limit,))

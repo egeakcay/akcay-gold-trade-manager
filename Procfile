@@ -1,1 +1,1 @@
-web: uvicorn akcay_gold_silver_trade_manager_mvp:app --host 0.0.0.0 --port $PORT
+web: uvicorn railway_main_htf_mvp_v3:app --host 0.0.0.0 --port $PORT

@@ -742,6 +742,9 @@ def health():
         "confidence_gate": ENABLE_CONFIDENCE_GATE,
         "reject_low_confidence": REJECT_LOW_CONFIDENCE,
         "session_filter_enabled": SESSION_FILTER_ENABLED,
+        "account_balance_gbp": ACCOUNT_BALANCE_GBP,
+        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+        "default_risk_gbp": DEFAULT_RISK_GBP,
     }
 
 

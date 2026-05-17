@@ -1,233 +1,80 @@
-# railway_main_gold_event_router_v1.py
-
-import os
 import json
+import os
 import sqlite3
-import hashlib
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Any, Dict, Tuple
+from datetime import datetime, date, time as dtime, timezone
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-# =============================================================
-# ENV / CONFIG
-# =============================================================
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-DB_PATH = os.getenv("DB_PATH", "trades.db")
+load_dotenv()
 
-ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() == "true"
+# =============================================================
+# AKÇAY RAILWAY BACKEND — EXECUTION READY v3.0
+# -------------------------------------------------------------
+# Supports:
+# - TradingView TRADE_SIGNAL payloads from Gold/Silver Pine
+# - TradingView PRICE_UPDATE payloads for runner/exit management
+# - MT5 executor lifecycle sync: ACTIVE -> EXECUTED -> CLOSED
+# - Backward-compatible legacy event="entry" payloads
+# =============================================================
+
+# =============================================================
+# CONFIG
+# =============================================================
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", os.getenv("TV_SECRET", "123abc456"))
+DB = os.getenv("DB_NAME", os.getenv("DB_PATH", "akcay_mvp.db"))
+
+# Risk amount sent to MT5 executor. Executor converts this into lots.
+DEFAULT_RISK_GBP = float(os.getenv("DEFAULT_RISK_GBP", "200"))
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
+MAX_DAILY_RISK_GBP = float(os.getenv("MAX_DAILY_RISK_GBP", "2000"))
+
+# Telegram optional
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() == "true"
 
+# Gate settings
 SESSION_FILTER_ENABLED = os.getenv("SESSION_FILTER_ENABLED", "false").lower() == "true"
 ENABLE_HTF_GATE = os.getenv("ENABLE_HTF_GATE", "false").lower() == "true"
 ENABLE_CONFIDENCE_GATE = os.getenv("ENABLE_CONFIDENCE_GATE", "false").lower() == "true"
 REJECT_LOW_CONFIDENCE = os.getenv("REJECT_LOW_CONFIDENCE", "false").lower() == "true"
 
-CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "60"))
-DAILY_TRADE_LIMIT = int(os.getenv("DAILY_TRADE_LIMIT", "10"))
+MIN_CONFIDENCE_TO_ACCEPT = int(os.getenv("MIN_CONFIDENCE_TO_ACCEPT", "6"))
+FULL_CONFIDENCE_THRESHOLD = int(os.getenv("FULL_CONFIDENCE_THRESHOLD", "9"))
 
-ACCOUNT_BALANCE_GBP = float(os.getenv("ACCOUNT_BALANCE_GBP", "10000"))
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2"))
+app = FastAPI(title="AKÇAY Tactical Auto Trading — Execution Backend", version="3.0.0")
 
-DUPLICATE_WINDOW_MINUTES = int(os.getenv("DUPLICATE_WINDOW_MINUTES", "15"))
-
+# =============================================================
+# CONSTANTS
+# =============================================================
 HTF_STATE_MAP = {
-    0: "BEARISH_ONLY",
-    1: "BULLISH_ONLY",
-    2: "NEUTRAL_BLOCKED",
+    0: "NO_TRADE_ZONE",
+    1: "LONG_ONLY",
+    2: "SHORT_ONLY",
     3: "BOTH_ALLOWED",
 }
 
-GOLD_SYMBOLS = {"XAUUSD", "GOLD", "XAU/USD", "XAU_USD", "XAUUSDM", "XAUUSDC"}
-SILVER_SYMBOLS = {"XAGUSD", "SILVER", "XAG/USD", "XAG_USD", "XAGUSDM", "XAGUSDC"}
+SESSION_SCORE_MAP = {
+    "BYPASSED": 0,
+    "FULL": 2,
+    "GOOD": 2,
+    "TRADEABLE": 1,
+    "WEAK": -2,
+    "REDUCED": -2,
+    "NEUTRAL": 0,
+    "UNKNOWN": 0,
+    "REJECT": -99,
+}
+
+VALID_INSTRUMENTS = {"GOLD", "SILVER"}
+VALID_DIRECTIONS = {"BUY", "SELL", "LONG", "SHORT"}
 
 # =============================================================
-# APP
-# =============================================================
-app = FastAPI(title="AKÇAY Event Router", version="1.0.0")
-
-# =============================================================
-# UTILS
-# =============================================================
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_json_dumps(value: Any) -> str:
-    try:
-        return json.dumps(value or {}, ensure_ascii=False)
-    except Exception:
-        return "{}"
-
-
-def make_trade_uid(instrument: str, direction: str, entry: float, setup: str, bar_time: Optional[int] = None) -> str:
-    minute_key = bar_time or int(datetime.now(timezone.utc).timestamp() // 60)
-    raw = f"{instrument}|{direction}|{round(entry, 5)}|{setup}|{minute_key}"
-    return hashlib.md5(raw.encode()).hexdigest()[:16]
-
-
-def classify_instrument(instrument: str) -> str:
-    if not instrument:
-        return "OTHER"
-    sym = instrument.upper().replace(" ", "")
-    if sym in GOLD_SYMBOLS or "XAUUSD" in sym or sym.startswith("XAU"):
-        return "GOLD"
-    if sym in SILVER_SYMBOLS or "XAGUSD" in sym or sym.startswith("XAG"):
-        return "SILVER"
-    return "OTHER"
-
-
-def normalize_direction(direction: str) -> str:
-    d = str(direction or "").upper().strip()
-    if d in {"LONG", "BUY"}:
-        return "BUY"
-    if d in {"SHORT", "SELL"}:
-        return "SELL"
-    raise ValueError(f"invalid direction: {direction}")
-
-# =============================================================
-# DB
-# =============================================================
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    con = db()
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event TEXT,
-            trade_uid TEXT,
-            instrument TEXT,
-            direction TEXT,
-            setup TEXT,
-            quality TEXT,
-            decision TEXT,
-            reason TEXT,
-            regime_score INTEGER,
-            atr_expanding INTEGER,
-            entry REAL,
-            stop REAL,
-            tp REAL,
-            tp1 REAL,
-            tp2 REAL,
-            current_price REAL,
-            risk_per_unit REAL,
-            atr_value REAL,
-            risk_amount_gbp REAL,
-            runner_config TEXT,
-            trend_state TEXT,
-            raw_payload TEXT,
-            telegram_sent INTEGER DEFAULT 0,
-            bar_time INTEGER,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_uid TEXT UNIQUE,
-            instrument TEXT,
-            direction TEXT,
-            entry REAL,
-            stop REAL,
-            tp REAL,
-            tp1 REAL,
-            tp2 REAL,
-            current_price REAL,
-            setup TEXT,
-            quality TEXT,
-            regime_score INTEGER,
-            atr_expanding INTEGER,
-            raw_payload TEXT,
-            risk_amount_gbp REAL,
-            risk_per_unit REAL,
-            atr_value REAL,
-            runner_config TEXT,
-            trend_state TEXT,
-            status TEXT,
-            reason TEXT,
-            bar_time INTEGER,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS market_state (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            instrument TEXT UNIQUE,
-            current_price REAL,
-            ema20 REAL,
-            atr_value REAL,
-            rsi REAL,
-            atr_expanding INTEGER,
-            ema_slope REAL,
-            regime_score INTEGER,
-            current_15m_bias TEXT,
-            latest_swing_low REAL,
-            latest_swing_high REAL,
-            raw_payload TEXT,
-            bar_time INTEGER,
-            updated_at TEXT NOT NULL
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-
-def migrate_db():
-    con = db()
-    cur = con.cursor()
-
-    def add_column_if_missing(table: str, column: str, definition: str):
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [row[1] for row in cur.fetchall()]
-        if column not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-    for table in ["signals", "trades"]:
-        add_column_if_missing(table, "event", "TEXT")
-        add_column_if_missing(table, "tp1", "REAL")
-        add_column_if_missing(table, "tp2", "REAL")
-        add_column_if_missing(table, "risk_per_unit", "REAL")
-        add_column_if_missing(table, "atr_value", "REAL")
-        add_column_if_missing(table, "runner_config", "TEXT")
-        add_column_if_missing(table, "trend_state", "TEXT")
-        add_column_if_missing(table, "bar_time", "INTEGER")
-
-    con.commit()
-    con.close()
-
-# =============================================================
-# PAYLOADS
+# MODELS
 # =============================================================
 class RunnerConfig(BaseModel):
     tp1_close_pct: Optional[int] = 30
@@ -251,15 +98,15 @@ class RunnerConfig(BaseModel):
 
 class TradeSignalPayload(BaseModel):
     secret: Optional[str] = None
-    event: str = "TRADE_SIGNAL"
+    event: Optional[str] = "TRADE_SIGNAL"
     bar_time: Optional[int] = None
     instrument: str
     direction: str
     entry: float
     stop: float
+    tp: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
-    tp: Optional[float] = None
     current_price: Optional[float] = None
     setup: Optional[str] = "default"
     quality: Optional[str] = "A"
@@ -270,13 +117,18 @@ class TradeSignalPayload(BaseModel):
     runner_config: Optional[RunnerConfig] = Field(default_factory=RunnerConfig)
     trend_state: Optional[Dict[str, Any]] = None
 
+    # Legacy HTF fields from older Silver script
+    htf_tf: Optional[str] = "120"
+    htf_state_code: Optional[int] = 3
+    htf_score: Optional[int] = 0
+
     class Config:
         extra = "allow"
 
 
 class PriceUpdatePayload(BaseModel):
     secret: Optional[str] = None
-    event: str = "PRICE_UPDATE"
+    event: Optional[str] = "PRICE_UPDATE"
     bar_time: Optional[int] = None
     instrument: str
     current_price: float
@@ -293,182 +145,314 @@ class PriceUpdatePayload(BaseModel):
     class Config:
         extra = "allow"
 
+
+class TradeStatusUpdate(BaseModel):
+    status: str
+    reason: Optional[str] = None
+    close_reason: Optional[str] = None
+    mt5_order: Optional[Any] = None
+    mt5_deal: Optional[Any] = None
+
+    class Config:
+        extra = "allow"
+
+
+# Legacy models kept for compatibility only.
+class DailyBiasPayload(BaseModel):
+    secret: str
+    system: Literal["AKCAY_DAILY_BIAS"]
+    ticker: str
+    bias: Literal["LONG", "SHORT", "NEUTRAL"]
+    price: float
+    tf: str
+
+
+class SignalPayload(BaseModel):
+    secret: str
+    system: Literal["PLAN_A_EM"]
+    ticker: str
+    side: Literal["LONG", "SHORT", "ANY"]
+    price: float
+    tf: str
+    action: str = "REVIEW"
+
 # =============================================================
-# TELEGRAM
+# DATABASE
 # =============================================================
-def send_telegram(text: str) -> bool:
-    if not ENABLE_TELEGRAM:
-        return False
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=8)
-        return response.status_code == 200
-    except Exception as exc:
-        print(f"Telegram error: {exc}")
-        return False
+def db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
 
 
-def telegram_trade_message(payload: TradeSignalPayload, decision: str, reason: str, risk_amount_gbp: Optional[float]) -> str:
-    emoji = "✅" if decision == "ACTIVE" else "❌"
-    lines = [
-        f"{emoji} {decision} — {payload.instrument} {normalize_direction(payload.direction)}",
-        f"Setup: {payload.setup} | Quality: {payload.quality}",
-        f"Entry: {payload.entry} | SL: {payload.stop}",
-        f"TP1: {payload.tp1} | TP2: {payload.tp2 or payload.tp}",
-        f"Regime: R{payload.regime_score} | ATR expanding: {payload.atr_expanding}",
-    ]
-    if risk_amount_gbp is not None:
-        lines.append(f"Risk: £{risk_amount_gbp}")
-    lines.append(f"Reason: {reason}")
-    lines.append(f"Time: {now()}")
-    return "\n".join(lines)
-
-# =============================================================
-# FILTERS
-# =============================================================
-def evaluate_session(instrument: str) -> Tuple[str, str]:
-    if not SESSION_FILTER_ENABLED:
-        return "BYPASSED", "SESSION_FILTER_DISABLED"
-    utc_hour = datetime.now(timezone.utc).hour
-    if 12 <= utc_hour < 16:
-        return "PRIME", "LONDON_NY_OVERLAP"
-    if 7 <= utc_hour < 12:
-        return "GOOD", "LONDON_SESSION"
-    if 16 <= utc_hour < 21:
-        return "GOOD", "NY_SESSION"
-    return "POOR", "OFF_HOURS"
-
-
-def session_allows_trade(session_quality: str) -> bool:
-    if not SESSION_FILTER_ENABLED:
-        return True
-    return session_quality in {"PRIME", "GOOD", "BYPASSED"}
-
-
-def compute_confidence(payload: TradeSignalPayload, session_quality: str) -> Tuple[int, str, List[str]]:
-    score = 0
-    reasons: List[str] = []
-
-    quality = (payload.quality or "").upper()
-    if quality == "A+":
-        score += 40
-        reasons.append("QUALITY_A_PLUS+40")
-    elif quality == "A":
-        score += 30
-        reasons.append("QUALITY_A+30")
-
-    regime = safe_int(payload.regime_score, 0)
-    if regime >= 5:
-        score += 25
-        reasons.append("REGIME_STRONG+25")
-    elif regime >= 3:
-        score += 15
-        reasons.append("REGIME_TRADEABLE+15")
-
-    if str(payload.atr_expanding).lower() in {"true", "1"}:
-        score += 10
-        reasons.append("ATR_EXPANDING+10")
-
-    if session_quality == "PRIME":
-        score += 20
-        reasons.append("SESSION_PRIME+20")
-    elif session_quality == "GOOD":
-        score += 10
-        reasons.append("SESSION_GOOD+10")
-    elif session_quality == "BYPASSED":
-        reasons.append("SESSION_BYPASSED+0")
-
-    mode = "HIGH" if score >= 70 else ("MEDIUM" if score >= 40 else "LOW")
-    return min(score, 100), mode, reasons
-
-
-def is_duplicate(trade_uid: str, instrument: str, direction: str, entry: float) -> bool:
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)).isoformat()
+def init_db():
     con = db()
     cur = con.cursor()
+
     cur.execute("""
-        SELECT id FROM signals
-        WHERE event = 'TRADE_SIGNAL'
-          AND (trade_uid = ? OR (instrument = ? AND direction = ? AND ABS(entry - ?) < 0.00001))
-          AND created_at >= ?
-        LIMIT 1
-    """, (trade_uid, instrument, direction, entry, cutoff))
-    row = cur.fetchone()
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_uid TEXT UNIQUE,
+        instrument TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        entry REAL NOT NULL,
+        stop REAL NOT NULL,
+        tp REAL,
+        tp1 REAL,
+        tp2 REAL,
+        current_price REAL,
+        setup TEXT,
+        quality TEXT,
+        regime_score INTEGER,
+        atr_expanding INTEGER,
+        htf_tf TEXT,
+        htf_state_code INTEGER,
+        htf_state TEXT,
+        htf_score INTEGER,
+        session_quality TEXT,
+        confidence_score INTEGER,
+        confidence_mode TEXT,
+        risk_amount_gbp REAL,
+        risk_per_unit REAL,
+        atr_value REAL,
+        runner_config TEXT,
+        trend_state TEXT,
+        raw_payload TEXT,
+        status TEXT NOT NULL,
+        reason TEXT,
+        bar_time INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_uid TEXT,
+        instrument TEXT,
+        direction TEXT,
+        setup TEXT,
+        decision TEXT,
+        reason TEXT,
+        regime_score INTEGER,
+        htf_state_code INTEGER,
+        htf_state TEXT,
+        confidence_score INTEGER,
+        confidence_mode TEXT,
+        entry REAL,
+        stop REAL,
+        tp REAL,
+        tp1 REAL,
+        tp2 REAL,
+        raw_payload TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS market_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument TEXT UNIQUE,
+        current_price REAL,
+        ema20 REAL,
+        atr_value REAL,
+        rsi REAL,
+        atr_expanding INTEGER,
+        ema_slope REAL,
+        regime_score INTEGER,
+        current_15m_bias TEXT,
+        latest_swing_low REAL,
+        latest_swing_high REAL,
+        raw_payload TEXT,
+        bar_time INTEGER,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS daily_bias (
+        ticker TEXT PRIMARY KEY,
+        bias TEXT NOT NULL,
+        valid_date TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    con.commit()
     con.close()
-    return row is not None
 
 
-def count_todays_active_trades() -> int:
-    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+def migrate_db():
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'ACTIVE' AND created_at >= ?", (start_of_day,))
-    row = cur.fetchone()
+
+    def add_column_if_missing(table: str, column: str, definition: str):
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [row[1] for row in cur.fetchall()]
+        if column not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    for col, definition in {
+        "tp1": "REAL",
+        "tp2": "REAL",
+        "risk_per_unit": "REAL",
+        "atr_value": "REAL",
+        "runner_config": "TEXT",
+        "trend_state": "TEXT",
+        "raw_payload": "TEXT",
+        "bar_time": "INTEGER",
+        "updated_at": "TEXT",
+    }.items():
+        add_column_if_missing("trades", col, definition)
+
+    for col, definition in {
+        "tp1": "REAL",
+        "tp2": "REAL",
+        "raw_payload": "TEXT",
+    }.items():
+        add_column_if_missing("signals", col, definition)
+
+    con.commit()
     con.close()
-    return row["c"] if row else 0
+
+
+init_db()
+migrate_db()
+
+# =============================================================
+# HELPERS
+# =============================================================
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_str() -> str:
+    return str(date.today())
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def bool_to_int(value: Any) -> int:
+    return 1 if str(value).lower() in {"true", "1", "yes"} else 0
+
+
+def normalize_direction(direction: str) -> str:
+    d = str(direction or "").upper().strip()
+    if d in {"BUY", "LONG"}:
+        return "BUY"
+    if d in {"SELL", "SHORT"}:
+        return "SELL"
+    raise HTTPException(status_code=400, detail="Invalid direction")
+
+
+def normalize_instrument(instrument: str) -> str:
+    i = str(instrument or "").upper().strip()
+    if i not in VALID_INSTRUMENTS:
+        raise HTTPException(status_code=400, detail="Invalid instrument")
+    return i
+
+
+def check_secret(secret: Optional[str]):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+
+def htf_state_text(code: int) -> str:
+    return HTF_STATE_MAP.get(code, "UNKNOWN")
+
+
+def get_htf_fields(payload: TradeSignalPayload) -> Tuple[int, str, int, str]:
+    trend_state = payload.trend_state or {}
+    htf_code = safe_int(trend_state.get("htf_state_code", payload.htf_state_code), 3)
+    htf_score = safe_int(trend_state.get("htf_score", payload.htf_score), 0)
+    current_15m_bias = str(trend_state.get("current_15m_bias", ""))
+    return htf_code, htf_state_text(htf_code), htf_score, current_15m_bias
+
+
+def make_trade_uid(payload: TradeSignalPayload) -> str:
+    # Pine sends bar_time; use it to avoid duplicate micro differences while allowing future signals.
+    entry = round(float(payload.entry), 3)
+    stop = round(float(payload.stop), 3)
+    tp2 = round(float(payload.tp2 if payload.tp2 is not None else payload.tp or 0), 3)
+    bar_time = payload.bar_time or int(datetime.now(timezone.utc).timestamp() // 60)
+    direction = normalize_direction(payload.direction)
+    instrument = normalize_instrument(payload.instrument)
+    return f"{instrument}:{direction}:{payload.setup}:{entry}:{stop}:{tp2}:{bar_time}"
+
+
+def raw_json(model: BaseModel) -> str:
+    return model.model_dump_json()
 
 # =============================================================
 # LOGGING / STORAGE
 # =============================================================
-def log_signal(payload: TradeSignalPayload, trade_uid: str, decision: str, reason: str, risk_amount_gbp: Optional[float], telegram_sent: bool):
+def log_signal(payload: TradeSignalPayload, trade_uid: str, decision: str, reason: str, htf_code: int, htf_state: str, score: Optional[int], mode: Optional[str]):
     con = db()
     cur = con.cursor()
-    raw = payload.model_dump_json()
     tp2_or_tp = payload.tp2 if payload.tp2 is not None else payload.tp
     cur.execute("""
         INSERT INTO signals
-        (event, trade_uid, instrument, direction, setup, quality, decision, reason,
-         regime_score, atr_expanding, entry, stop, tp, tp1, tp2, current_price,
-         risk_per_unit, atr_value, risk_amount_gbp, runner_config, trend_state,
-         raw_payload, telegram_sent, bar_time, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (trade_uid, instrument, direction, setup, decision, reason,
+         regime_score, htf_state_code, htf_state, confidence_score,
+         confidence_mode, entry, stop, tp, tp1, tp2, raw_payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        "TRADE_SIGNAL",
         trade_uid,
-        payload.instrument,
+        normalize_instrument(payload.instrument),
         normalize_direction(payload.direction),
         payload.setup,
-        payload.quality,
         decision,
         reason,
         safe_int(payload.regime_score, 0),
-        1 if str(payload.atr_expanding).lower() in {"true", "1"} else 0,
+        htf_code,
+        htf_state,
+        score,
+        mode,
         safe_float(payload.entry),
         safe_float(payload.stop),
         safe_float(tp2_or_tp),
         safe_float(payload.tp1),
         safe_float(tp2_or_tp),
-        safe_float(payload.current_price if payload.current_price is not None else payload.entry),
-        safe_float(payload.risk_per_unit, abs(payload.entry - payload.stop)),
-        safe_float(payload.atr_value),
-        risk_amount_gbp,
-        payload.runner_config.model_dump_json() if payload.runner_config else "{}",
-        safe_json_dumps(payload.trend_state),
-        raw,
-        1 if telegram_sent else 0,
-        safe_int(payload.bar_time, 0),
+        raw_json(payload),
         now(),
     ))
     con.commit()
     con.close()
 
 
-def save_trade(payload: TradeSignalPayload, trade_uid: str, status: str, reason: str, risk_amount_gbp: float):
+def save_trade(payload: TradeSignalPayload, trade_uid: str, status: str, reason: str, htf_state: str, htf_code: int, htf_score: int, session_quality: str, confidence_score: int, confidence_mode: str, risk_amount_gbp: float):
     con = db()
     cur = con.cursor()
-    raw = payload.model_dump_json()
     tp2_or_tp = payload.tp2 if payload.tp2 is not None else payload.tp
+    risk_per_unit = payload.risk_per_unit if payload.risk_per_unit is not None else abs(payload.entry - payload.stop)
     cur.execute("""
         INSERT OR IGNORE INTO trades
         (trade_uid, instrument, direction, entry, stop, tp, tp1, tp2, current_price,
-         setup, quality, regime_score, atr_expanding, raw_payload, risk_amount_gbp,
-         risk_per_unit, atr_value, runner_config, trend_state, status, reason, bar_time, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         setup, quality, regime_score, atr_expanding, htf_tf, htf_state_code,
+         htf_state, htf_score, session_quality, confidence_score,
+         confidence_mode, risk_amount_gbp, risk_per_unit, atr_value,
+         runner_config, trend_state, raw_payload, status, reason, bar_time, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trade_uid,
-        payload.instrument,
+        normalize_instrument(payload.instrument),
         normalize_direction(payload.direction),
         safe_float(payload.entry),
         safe_float(payload.stop),
@@ -479,29 +463,256 @@ def save_trade(payload: TradeSignalPayload, trade_uid: str, status: str, reason:
         payload.setup,
         payload.quality,
         safe_int(payload.regime_score, 0),
-        1 if str(payload.atr_expanding).lower() in {"true", "1"} else 0,
-        raw,
+        bool_to_int(payload.atr_expanding),
+        str(payload.htf_tf or "120"),
+        htf_code,
+        htf_state,
+        htf_score,
+        session_quality,
+        confidence_score,
+        confidence_mode,
         risk_amount_gbp,
-        safe_float(payload.risk_per_unit, abs(payload.entry - payload.stop)),
+        safe_float(risk_per_unit),
         safe_float(payload.atr_value),
         payload.runner_config.model_dump_json() if payload.runner_config else "{}",
-        safe_json_dumps(payload.trend_state),
+        json.dumps(payload.trend_state or {}, ensure_ascii=False),
+        raw_json(payload),
         status,
         reason,
         safe_int(payload.bar_time, 0),
         now(),
+        now(),
     ))
     con.commit()
     con.close()
 
 
-def save_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
-    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid secret")
+def trade_uid_exists(trade_uid: str) -> bool:
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM trades WHERE trade_uid = ?", (trade_uid,))
+    count = cur.fetchone()[0]
+    con.close()
+    return count > 0
+
+
+def active_trade_count() -> int:
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'ACTIVE'")
+    count = cur.fetchone()[0]
+    con.close()
+    return count
+
+
+def daily_trade_count() -> int:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE status IN ('ACTIVE','EXECUTED') AND substr(created_at, 1, 10) = ?
+    """, (today_str(),))
+    count = cur.fetchone()[0]
+    con.close()
+    return count
+
+
+def daily_risk_used() -> float:
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(risk_amount_gbp), 0)
+        FROM trades
+        WHERE status IN ('ACTIVE','EXECUTED') AND substr(created_at, 1, 10) = ?
+    """, (today_str(),))
+    value = cur.fetchone()[0]
+    con.close()
+    return float(value or 0.0)
+
+# =============================================================
+# SESSION / HTF / CONFIDENCE
+# =============================================================
+def current_utc_time() -> dtime:
+    return datetime.utcnow().time()
+
+
+def in_time_range(t: dtime, start: dtime, end: dtime) -> bool:
+    if start <= end:
+        return start <= t <= end
+    return t >= start or t <= end
+
+
+def classify_session(instrument: str) -> Tuple[str, str]:
+    if not SESSION_FILTER_ENABLED:
+        return "BYPASSED", "SESSION_FILTER_DISABLED"
+
+    t = current_utc_time()
+    instrument = instrument.upper()
+
+    if in_time_range(t, dtime(21, 55), dtime(22, 10)):
+        return "REJECT", "DEAD_ROLLOVER_REJECT"
+
+    if instrument == "GOLD":
+        if in_time_range(t, dtime(7, 0), dtime(17, 30)):
+            return "FULL", "GOLD_LONDON_NY_FULL"
+        if in_time_range(t, dtime(23, 0), dtime(6, 59)):
+            return "WEAK", "GOLD_ASIA_WEAK"
+        return "TRADEABLE", "GOLD_OTHER_TRADEABLE"
+
+    if instrument == "SILVER":
+        if in_time_range(t, dtime(7, 0), dtime(16, 30)):
+            return "FULL", "SILVER_LONDON_NY_FULL"
+        if in_time_range(t, dtime(17, 0), dtime(20, 59)):
+            return "WEAK", "SILVER_LATE_WEAK"
+        return "REJECT", "SILVER_OUTSIDE_ALLOWED_REJECT"
+
+    return "REJECT", "INVALID_INSTRUMENT_SESSION_REJECT"
+
+
+def htf_bias_allows_trade(direction: str, htf_state_code: int) -> Tuple[bool, str]:
+    if not ENABLE_HTF_GATE:
+        return True, "HTF_GATE_DISABLED"
+    if htf_state_code == 0:
+        return False, "HTF_NO_TRADE_ZONE_REJECT"
+    if direction == "BUY" and htf_state_code == 2:
+        return False, "HTF_SHORT_ONLY_REJECT"
+    if direction == "SELL" and htf_state_code == 1:
+        return False, "HTF_LONG_ONLY_REJECT"
+    return True, "HTF_OK"
+
+
+def calculate_confidence(payload: TradeSignalPayload, session_quality: str, htf_code: int, htf_score: int) -> Tuple[int, List[str]]:
+    regime_score = safe_int(payload.regime_score, 0)
+    atr_expanding = bool_to_int(payload.atr_expanding)
+    quality = str(payload.quality or "A").upper().strip()
+    setup = str(payload.setup or "").upper().strip()
+
+    score = 0
+    reasons: List[str] = []
+
+    if htf_code in {1, 2}:
+        score += 3
+        reasons.append(f"HTF_STRONG:{htf_state_text(htf_code)}")
+    elif htf_code == 3:
+        score += 1
+        reasons.append("HTF_BOTH_ALLOWED")
+    else:
+        reasons.append("HTF_NO_TRADE_ZONE")
+
+    if htf_score >= 5:
+        score += 1
+        reasons.append("HTF_SCORE_5")
+
+    if regime_score >= 5:
+        score += 3
+        reasons.append(f"REGIME_STRONG:R{regime_score}")
+    elif regime_score >= 3:
+        score += 1
+        reasons.append(f"REGIME_TRADEABLE:R{regime_score}")
+    else:
+        score -= 3
+        reasons.append(f"REGIME_WEAK:R{regime_score}")
+
+    if atr_expanding == 1:
+        score += 1
+        reasons.append("ATR_EXPANDING")
+
+    if quality == "A+":
+        score += 1
+        reasons.append("QUALITY_A_PLUS")
+
+    if setup in {"BO_LONG", "BO_SHORT", "BREAKOUT_CONTINUATION_LONG", "BREAKDOWN_CONTINUATION_SHORT"}:
+        score += 1
+        reasons.append("BO_OR_BREAKOUT_SETUP")
+
+    session_score = SESSION_SCORE_MAP.get(session_quality, 0)
+    score += session_score
+    reasons.append(f"SESSION_{session_quality}:{session_score}")
+
+    return score, reasons
+
+
+def confidence_mode(score: int) -> str:
+    if not ENABLE_CONFIDENCE_GATE:
+        return "LOG_ONLY"
+    if score < MIN_CONFIDENCE_TO_ACCEPT:
+        return "NO_EXECUTE"
+    if score < FULL_CONFIDENCE_THRESHOLD:
+        return "REDUCED"
+    return "FULL"
+
+# =============================================================
+# TELEGRAM
+# =============================================================
+def send_telegram(text: str):
+    if not ENABLE_TELEGRAM:
+        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=8)
+    except Exception as exc:
+        print(f"Telegram error: {exc}")
+
+
+def telegram_trade_message(payload: TradeSignalPayload, decision: str, reason: str, htf_state: str, session_quality: str, score: int, mode: str) -> str:
+    icon = "✅" if decision == "ACTIVE" else "❌"
+    tp2_or_tp = payload.tp2 if payload.tp2 is not None else payload.tp
+    return (
+        f"{icon} {decision} — {normalize_instrument(payload.instrument)} {normalize_direction(payload.direction)}\n"
+        f"Setup: {payload.setup} | Quality: {payload.quality}\n"
+        f"Entry: {payload.entry} | SL: {payload.stop}\n"
+        f"TP1: {payload.tp1} | TP2: {tp2_or_tp}\n"
+        f"Regime: R{payload.regime_score} | ATR expanding: {payload.atr_expanding}\n"
+        f"HTF: {htf_state} | Session: {session_quality}\n"
+        f"Confidence: {score} / Mode: {mode}\n"
+        f"Risk: £{DEFAULT_RISK_GBP}\n"
+        f"Reason: {reason}\n"
+        f"Time: {now()}"
+    )
+
+# =============================================================
+# WEBHOOK ROUTER
+# =============================================================
+def normalize_raw_body(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    raise HTTPException(status_code=422, detail="invalid JSON body")
+
+
+async def route_webhook(request: Request) -> Dict[str, Any]:
+    try:
+        raw = await request.json()
+    except Exception:
+        body = (await request.body()).decode("utf-8", errors="ignore").strip()
+        raw = body
+
+    payload = normalize_raw_body(raw)
+    event = str(payload.get("event", "entry")).upper().strip()
+
+    if event in {"TRADE_SIGNAL", "ENTRY"}:
+        return handle_trade_signal(TradeSignalPayload(**payload))
+
+    if event == "PRICE_UPDATE":
+        return handle_price_update(PriceUpdatePayload(**payload))
+
+    raise HTTPException(status_code=422, detail=f"unsupported event: {event}")
+
+
+def handle_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
+    check_secret(payload.secret)
+    instrument = normalize_instrument(payload.instrument)
 
     con = db()
     cur = con.cursor()
-    raw = payload.model_dump_json()
     cur.execute("""
         INSERT INTO market_state
         (instrument, current_price, ema20, atr_value, rsi, atr_expanding, ema_slope,
@@ -523,156 +734,122 @@ def save_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
             bar_time=excluded.bar_time,
             updated_at=excluded.updated_at
     """, (
-        payload.instrument,
+        instrument,
         safe_float(payload.current_price),
         safe_float(payload.ema20),
         safe_float(payload.atr_value),
         safe_float(payload.rsi),
-        1 if str(payload.atr_expanding).lower() in {"true", "1"} else 0,
+        bool_to_int(payload.atr_expanding),
         safe_float(payload.ema_slope),
         safe_int(payload.regime_score, 0),
         payload.current_15m_bias,
         safe_float(payload.latest_swing_low),
         safe_float(payload.latest_swing_high),
-        raw,
+        raw_json(payload),
         safe_int(payload.bar_time, 0),
         now(),
     ))
     con.commit()
     con.close()
-    return {"status": "PRICE_UPDATE_OK", "instrument": payload.instrument, "bar_time": payload.bar_time}
+    return {"status": "PRICE_UPDATE_OK", "instrument": instrument, "bar_time": payload.bar_time}
 
-# =============================================================
-# CORE HANDLERS
-# =============================================================
+
 def handle_trade_signal(payload: TradeSignalPayload) -> Dict[str, Any]:
-    if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid secret")
+    check_secret(payload.secret)
 
+    instrument = normalize_instrument(payload.instrument)
     direction = normalize_direction(payload.direction)
+    tp2_or_tp = payload.tp2 if payload.tp2 is not None else payload.tp
+
     if payload.entry <= 0 or payload.stop <= 0:
-        raise HTTPException(status_code=422, detail="entry/stop must be > 0")
-
-    if payload.tp2 is None and payload.tp is None:
-        raise HTTPException(status_code=422, detail="tp2 or tp is required")
-
+        raise HTTPException(status_code=400, detail="entry/stop must be > 0")
+    if tp2_or_tp is None or safe_float(tp2_or_tp) <= 0:
+        raise HTTPException(status_code=400, detail="tp2 or tp must be > 0")
+    if payload.tp1 is None:
+        # Legacy fallback: TP1 halfway between entry and final TP.
+        payload.tp1 = payload.entry + ((safe_float(tp2_or_tp) - payload.entry) * 0.5)
     if payload.current_price is None:
         payload.current_price = payload.entry
-
     if payload.risk_per_unit is None:
         payload.risk_per_unit = abs(payload.entry - payload.stop)
 
-    trade_uid = make_trade_uid(payload.instrument, direction, payload.entry, payload.setup or "default", payload.bar_time)
-    risk_amount_gbp = round(ACCOUNT_BALANCE_GBP * (RISK_PER_TRADE_PCT / 100.0), 2)
+    htf_code, htf_state, htf_score, _ = get_htf_fields(payload)
+    trade_uid = make_trade_uid(payload)
 
-    if is_duplicate(trade_uid, payload.instrument, direction, payload.entry):
-        reason = "DUPLICATE_SIGNAL"
-        sent = send_telegram(telegram_trade_message(payload, "DUPLICATE", reason, risk_amount_gbp))
-        log_signal(payload, trade_uid, "DUPLICATE", reason, risk_amount_gbp, sent)
-        return {"status": "DUPLICATE", "trade_uid": trade_uid, "reason": reason}
+    if trade_uid_exists(trade_uid):
+        reason = "DUPLICATE_SIGNAL_REJECT"
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, None, None)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, "UNKNOWN", 0, "NO_EXECUTE"))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
 
-    session_quality, session_reason = evaluate_session(payload.instrument)
-    score, mode, score_reasons = compute_confidence(payload, session_quality)
+    session_quality, session_reason = classify_session(instrument)
+    if session_quality == "REJECT":
+        reason = session_reason
+        score, _ = calculate_confidence(payload, "UNKNOWN", htf_code, htf_score)
+        mode = "NO_EXECUTE"
+        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
 
-    if not session_allows_trade(session_quality):
-        reason = f"SESSION_FILTER:{session_reason}"
-        sent = send_telegram(telegram_trade_message(payload, "REJECTED", reason, risk_amount_gbp))
-        log_signal(payload, trade_uid, "REJECTED", reason, risk_amount_gbp, sent)
-        return {"status": "REJECTED", "trade_uid": trade_uid, "reason": reason}
+    htf_allowed, htf_reason = htf_bias_allows_trade(direction, htf_code)
+    if not htf_allowed:
+        reason = htf_reason
+        score, _ = calculate_confidence(payload, session_quality, htf_code, htf_score)
+        mode = "NO_EXECUTE"
+        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid, "htf_state": htf_state}
 
-    if count_todays_active_trades() >= DAILY_TRADE_LIMIT:
-        reason = f"DAILY_LIMIT_REACHED:{DAILY_TRADE_LIMIT}"
-        sent = send_telegram(telegram_trade_message(payload, "DAILY_LIMIT", reason, risk_amount_gbp))
-        log_signal(payload, trade_uid, "DAILY_LIMIT", reason, risk_amount_gbp, sent)
-        return {"status": "DAILY_LIMIT", "trade_uid": trade_uid, "reason": reason}
+    if daily_trade_count() >= MAX_DAILY_TRADES:
+        reason = "DAILY_TRADE_LIMIT_REJECT"
+        score, _ = calculate_confidence(payload, session_quality, htf_code, htf_score)
+        mode = "NO_EXECUTE"
+        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
 
-    if ENABLE_CONFIDENCE_GATE and REJECT_LOW_CONFIDENCE and score < CONFIDENCE_MIN:
-        reason = f"LOW_CONFIDENCE:{score}<{CONFIDENCE_MIN}"
-        sent = send_telegram(telegram_trade_message(payload, "LOW_CONFIDENCE", reason, risk_amount_gbp))
-        log_signal(payload, trade_uid, "LOW_CONFIDENCE", reason, risk_amount_gbp, sent)
-        save_trade(payload, trade_uid, "REJECTED", reason, 0.0)
-        return {"status": "LOW_CONFIDENCE", "trade_uid": trade_uid, "reason": reason}
+    projected_risk = daily_risk_used() + DEFAULT_RISK_GBP
+    if projected_risk > MAX_DAILY_RISK_GBP:
+        reason = "DAILY_RISK_LIMIT_REJECT"
+        score, _ = calculate_confidence(payload, session_quality, htf_code, htf_score)
+        mode = "NO_EXECUTE"
+        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
+
+    score, score_reasons = calculate_confidence(payload, session_quality, htf_code, htf_score)
+    mode = confidence_mode(score)
+
+    if REJECT_LOW_CONFIDENCE and mode == "NO_EXECUTE":
+        reason = "LOW_CONFIDENCE_REJECT"
+        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
+        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
+        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid, "confidence_score": score, "confidence_reasons": score_reasons}
 
     reason = "ALL_FILTERS_PASSED"
-    sent = send_telegram(telegram_trade_message(payload, "ACTIVE", reason, risk_amount_gbp))
-    log_signal(payload, trade_uid, "ACTIVE", reason, risk_amount_gbp, sent)
-    save_trade(payload, trade_uid, "ACTIVE", reason, risk_amount_gbp)
+    save_trade(payload, trade_uid, "ACTIVE", reason, htf_state, htf_code, htf_score, session_quality, score, mode, DEFAULT_RISK_GBP)
+    log_signal(payload, trade_uid, "ACTIVE", reason, htf_code, htf_state, score, mode)
+    send_telegram(telegram_trade_message(payload, "ACTIVE", reason, htf_state, session_quality, score, mode))
 
     return {
-        "status": "ACTIVE",
-        "trade_uid": trade_uid,
+        "decision": "ACTIVE",
         "reason": reason,
-        "instrument": payload.instrument,
-        "direction": direction,
-        "entry": payload.entry,
-        "stop": payload.stop,
-        "tp": payload.tp2 if payload.tp2 is not None else payload.tp,
-        "tp1": payload.tp1,
-        "tp2": payload.tp2 if payload.tp2 is not None else payload.tp,
-        "current_price": payload.current_price,
-        "risk_per_unit": payload.risk_per_unit,
-        "atr_value": payload.atr_value,
-        "risk_amount_gbp": risk_amount_gbp,
+        "trade_uid": trade_uid,
+        "htf_state": htf_state,
+        "session_quality": session_quality,
         "confidence_score": score,
         "confidence_mode": mode,
         "confidence_reasons": score_reasons,
     }
 
-
-def normalize_raw_body(raw: Any) -> Dict[str, Any]:
-    # Handles clean dict and double-encoded JSON strings from TradingView.
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    raise HTTPException(status_code=422, detail="invalid JSON body")
-
-
-async def route_webhook(request: Request) -> Dict[str, Any]:
-    try:
-        raw = await request.json()
-    except Exception:
-        body = (await request.body()).decode("utf-8", errors="ignore").strip()
-        raw = body
-
-    payload = normalize_raw_body(raw)
-    event = str(payload.get("event", "")).upper().strip()
-
-    if event == "TRADE_SIGNAL":
-        return handle_trade_signal(TradeSignalPayload(**payload))
-
-    if event == "PRICE_UPDATE":
-        return save_price_update(PriceUpdatePayload(**payload))
-
-    raise HTTPException(status_code=422, detail=f"unsupported event: {event}")
-
 # =============================================================
 # ROUTES
 # =============================================================
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    migrate_db()
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "time": now(),
-        "version": "event_router_v1",
-        "supported_events": ["TRADE_SIGNAL", "PRICE_UPDATE"],
-        "session_filter_enabled": SESSION_FILTER_ENABLED,
-        "account_balance_gbp": ACCOUNT_BALANCE_GBP,
-        "risk_per_trade_pct": RISK_PER_TRADE_PCT,
-    }
-
-
 @app.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request):
     return await route_webhook(request)
@@ -684,13 +861,57 @@ async def webhook_entry(request: Request):
 
 
 @app.get("/trades")
-def get_trades(status: Optional[str] = Query(default="ACTIVE"), limit: int = 200):
+def get_trades(status: Optional[str] = Query(default="ACTIVE"), limit: int = 100):
     con = db()
     cur = con.cursor()
+
     if status is None or status == "":
         cur.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
     else:
         cur.execute("SELECT * FROM trades WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit))
+
+    rows = [dict(row) for row in cur.fetchall()]
+    con.close()
+    return rows
+
+
+@app.post("/trades/{trade_id}/status")
+def update_trade_status(trade_id: int, payload: TradeStatusUpdate):
+    new_status = str(payload.status or "").upper().strip()
+    if new_status not in {"ACTIVE", "EXECUTED", "CLOSED", "REJECTED", "CANCELLED"}:
+        raise HTTPException(status_code=422, detail=f"invalid status: {payload.status}")
+
+    reason = payload.reason or payload.close_reason or "STATUS_UPDATED"
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT id FROM trades WHERE id = ?", (trade_id,))
+    row = cur.fetchone()
+    if row is None:
+        con.close()
+        raise HTTPException(status_code=404, detail="trade not found")
+
+    cur.execute("""
+        UPDATE trades
+        SET status = ?, reason = ?, updated_at = ?
+        WHERE id = ?
+    """, (new_status, reason, now(), trade_id))
+    con.commit()
+    con.close()
+
+    return {"status": "ok", "trade_id": trade_id, "new_status": new_status, "reason": reason}
+
+
+@app.get("/market-state")
+def get_market_state(instrument: Optional[str] = None):
+    con = db()
+    cur = con.cursor()
+    if instrument:
+        cur.execute("SELECT * FROM market_state WHERE instrument = ?", (instrument.upper(),))
+        row = cur.fetchone()
+        con.close()
+        return dict(row) if row else {}
+
+    cur.execute("SELECT * FROM market_state ORDER BY updated_at DESC")
     rows = [dict(row) for row in cur.fetchall()]
     con.close()
     return rows
@@ -706,51 +927,56 @@ def get_signals(limit: int = 100):
     return rows
 
 
-@app.get("/market-state")
-def get_market_state(instrument: Optional[str] = None):
-    con = db()
-    cur = con.cursor()
-    if instrument:
-        cur.execute("SELECT * FROM market_state WHERE instrument = ?", (instrument,))
-        row = cur.fetchone()
-        con.close()
-        return dict(row) if row else {}
-    cur.execute("SELECT * FROM market_state ORDER BY updated_at DESC")
-    rows = [dict(row) for row in cur.fetchall()]
-    con.close()
-    return rows
+@app.get("/health")
+def health():
+    return {
+        "status": "running",
+        "time": now(),
+        "version": "execution_ready_v3",
+        "supported_events": ["TRADE_SIGNAL", "PRICE_UPDATE", "entry"],
+        "session_filter_enabled": SESSION_FILTER_ENABLED,
+        "htf_gate": ENABLE_HTF_GATE,
+        "confidence_gate": ENABLE_CONFIDENCE_GATE,
+        "reject_low_confidence": REJECT_LOW_CONFIDENCE,
+        "default_risk_gbp": DEFAULT_RISK_GBP,
+        "max_daily_trades": MAX_DAILY_TRADES,
+        "max_daily_risk_gbp": MAX_DAILY_RISK_GBP,
+    }
 
 
-@app.get("/signals/rejected")
-def get_rejected_signals(limit: int = 100):
+@app.get("/status")
+def status():
+    return health()
+
+# =============================================================
+# LEGACY ROUTES — KEPT FOR COMPATIBILITY, NO DIRECT MT5 EXECUTION
+# =============================================================
+def save_daily_bias(ticker: str, bias: str):
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT * FROM signals
-        WHERE decision IN ('REJECTED','DAILY_LIMIT','LOW_CONFIDENCE','DUPLICATE','VALIDATION_ERROR')
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
-    rows = [dict(row) for row in cur.fetchall()]
+        INSERT OR REPLACE INTO daily_bias
+        (ticker, bias, valid_date, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (ticker, bias, today_str(), now()))
+    con.commit()
     con.close()
-    return rows
 
 
-@app.get("/signals/active")
-def get_active_signals(limit: int = 100):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM signals WHERE decision = 'ACTIVE' ORDER BY id DESC LIMIT ?", (limit,))
-    rows = [dict(row) for row in cur.fetchall()]
-    con.close()
-    return rows
+@app.post("/webhook/daily-bias")
+def daily_bias(payload: DailyBiasPayload):
+    check_secret(payload.secret)
+    save_daily_bias(payload.ticker, payload.bias)
+    return {"status": "ok", "ticker": payload.ticker, "bias": payload.bias, "message": "Daily bias saved"}
 
-# =============================================================
-# LOCAL RUN
-# =============================================================
+
+@app.post("/webhook/plan-a")
+def plan_a_signal(payload: SignalPayload):
+    check_secret(payload.secret)
+    return {"decision": "IGNORE", "reason": "LEGACY_PLAN_A_DISABLED_USE_WEBHOOK_ENTRY", "ticker": payload.ticker, "side": payload.side}
+
+
 if __name__ == "__main__":
     import uvicorn
-    init_db()
-    migrate_db()
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)

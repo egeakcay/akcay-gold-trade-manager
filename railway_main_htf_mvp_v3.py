@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import datetime, date, time as dtime, timedelta, timezone
+from datetime import datetime, date, time as dtime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import requests
@@ -30,14 +30,6 @@ DB = os.getenv("DB_NAME", os.getenv("DB_PATH", "akcay_mvp.db"))
 # Risk amount sent to MT5 executor. Executor converts this into lots.
 DEFAULT_RISK_GBP = float(os.getenv("DEFAULT_RISK_GBP", "200"))
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "20"))
-MAX_DAILY_RISK_GBP = float(os.getenv("MAX_DAILY_RISK_GBP", "2000"))
-
-# Freshness window for /trades?status=ACTIVE.
-# Stale ACTIVE trades (Railway never received EXECUTED confirmation, but the
-# real position was opened in MT5 yesterday/earlier) must NOT be re-served to
-# the executor or it would re-open them after the local executed_trades.json
-# rolls over at midnight.
-MAX_ACTIVE_TRADE_AGE_SECONDS = int(os.getenv("MAX_ACTIVE_TRADE_AGE_SECONDS", "180"))
 
 # Telegram optional
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -524,18 +516,6 @@ def daily_trade_count() -> int:
     return count
 
 
-def daily_risk_used() -> float:
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(risk_amount_gbp), 0)
-        FROM trades
-        WHERE status IN ('ACTIVE','EXECUTED') AND substr(created_at, 1, 10) = ?
-    """, (today_str(),))
-    value = cur.fetchone()[0]
-    con.close()
-    return float(value or 0.0)
-
 # =============================================================
 # SESSION / HTF / CONFIDENCE
 # =============================================================
@@ -796,7 +776,8 @@ def handle_trade_signal(payload: TradeSignalPayload) -> Dict[str, Any]:
         mode = "NO_EXECUTE"
         save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
         log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
-        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        # Telegram notification intentionally suppressed for session rejects.
+        # DB + log preserved for audit; user requested quieter rejection chatter.
         return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
 
     htf_allowed, htf_reason = htf_bias_allows_trade(direction, htf_code)
@@ -806,7 +787,7 @@ def handle_trade_signal(payload: TradeSignalPayload) -> Dict[str, Any]:
         mode = "NO_EXECUTE"
         save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
         log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
-        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        # Telegram notification intentionally suppressed for HTF rejects.
         return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid, "htf_state": htf_state}
 
     if daily_trade_count() >= MAX_DAILY_TRADES:
@@ -815,18 +796,15 @@ def handle_trade_signal(payload: TradeSignalPayload) -> Dict[str, Any]:
         mode = "NO_EXECUTE"
         save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
         log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
-        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
+        # Telegram notification intentionally suppressed for trade-count rejects.
         return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
 
-    projected_risk = daily_risk_used() + DEFAULT_RISK_GBP
-    if projected_risk > MAX_DAILY_RISK_GBP:
-        reason = "DAILY_RISK_LIMIT_REJECT"
-        score, _ = calculate_confidence(payload, session_quality, htf_code, htf_score)
-        mode = "NO_EXECUTE"
-        save_trade(payload, trade_uid, "REJECTED", reason, htf_state, htf_code, htf_score, session_quality, score, mode, 0.0)
-        log_signal(payload, trade_uid, "REJECTED", reason, htf_code, htf_state, score, mode)
-        send_telegram(telegram_trade_message(payload, "REJECTED", reason, htf_state, session_quality, score, mode))
-        return {"decision": "REJECTED", "reason": reason, "trade_uid": trade_uid}
+    # Daily risk gate intentionally REMOVED from Railway.
+    # All risk-based execution decisions (soft/hard tiered limits, half-risk
+    # fallback, lot scaling, daily budget tracking) now live exclusively in
+    # the MT5 executor, which has access to live account balance and live
+    # position state. Railway's job is to validate the payload, deduplicate,
+    # store the signal, and forward it to the executor as ACTIVE.
 
     score, score_reasons = calculate_confidence(payload, session_quality, htf_code, htf_score)
     mode = confidence_mode(score)
@@ -874,31 +852,6 @@ def get_trades(status: Optional[str] = Query(default="ACTIVE"), limit: int = 100
 
     if status is None or status == "":
         cur.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
-    elif str(status).upper() == "ACTIVE":
-        # Freshness guard: only return ACTIVE trades that are still recent.
-        # Prevents the executor from re-opening stale ACTIVE trades the day
-        # after a missed status update (MT5 position was actually opened, but
-        # Railway never received the EXECUTED confirmation).
-        now_unix = int(datetime.now(timezone.utc).timestamp())
-        unix_cutoff = now_unix - MAX_ACTIVE_TRADE_AGE_SECONDS
-
-        iso_cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=MAX_ACTIVE_TRADE_AGE_SECONDS)
-        ).isoformat()
-
-        cur.execute(
-            """
-            SELECT * FROM trades
-            WHERE status = 'ACTIVE'
-              AND (
-                    (bar_time IS NOT NULL AND bar_time > 0 AND bar_time >= ?)
-                 OR created_at >= ?
-              )
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (unix_cutoff, iso_cutoff, limit),
-        )
     else:
         cur.execute("SELECT * FROM trades WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit))
 
@@ -972,7 +925,6 @@ def health():
         "reject_low_confidence": REJECT_LOW_CONFIDENCE,
         "default_risk_gbp": DEFAULT_RISK_GBP,
         "max_daily_trades": MAX_DAILY_TRADES,
-        "max_daily_risk_gbp": MAX_DAILY_RISK_GBP,
     }
 
 

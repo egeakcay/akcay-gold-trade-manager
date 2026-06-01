@@ -147,6 +147,8 @@ class PriceUpdatePayload(BaseModel):
     current_15m_bias: Optional[str] = None
     latest_swing_low: Optional[float] = None
     latest_swing_high: Optional[float] = None
+    trail_ref_low: Optional[float] = None
+    trail_ref_high: Optional[float] = None
 
     class Config:
         extra = "allow"
@@ -270,11 +272,26 @@ def init_db():
         current_15m_bias TEXT,
         latest_swing_low REAL,
         latest_swing_high REAL,
+        trail_ref_low REAL,
+        trail_ref_high REAL,
         raw_payload TEXT,
         bar_time INTEGER,
         updated_at TEXT NOT NULL
     )
     """)
+
+    # Migration: add trail_ref columns to existing market_state tables.
+    # CREATE TABLE IF NOT EXISTS is a no-op when the table already exists,
+    # so older deployments need an explicit ALTER. Both columns wrapped in
+    # try/except because SQLite raises if the column already exists, and
+    # there's no portable IF NOT EXISTS for ALTER TABLE ADD COLUMN.
+    for col_name in ("trail_ref_low", "trail_ref_high"):
+        try:
+            cur.execute(f"ALTER TABLE market_state ADD COLUMN {col_name} REAL")
+            print(f"MIGRATION: added column market_state.{col_name}")
+        except Exception:
+            # Column already exists — safe to ignore.
+            pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS daily_bias (
@@ -711,8 +728,9 @@ def handle_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
         INSERT INTO market_state
         (instrument, current_price, ema20, atr_value, rsi, atr_expanding, ema_slope,
          regime_score, current_15m_bias, latest_swing_low, latest_swing_high,
+         trail_ref_low, trail_ref_high,
          raw_payload, bar_time, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(instrument) DO UPDATE SET
             current_price=excluded.current_price,
             ema20=excluded.ema20,
@@ -724,6 +742,8 @@ def handle_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
             current_15m_bias=excluded.current_15m_bias,
             latest_swing_low=excluded.latest_swing_low,
             latest_swing_high=excluded.latest_swing_high,
+            trail_ref_low=excluded.trail_ref_low,
+            trail_ref_high=excluded.trail_ref_high,
             raw_payload=excluded.raw_payload,
             bar_time=excluded.bar_time,
             updated_at=excluded.updated_at
@@ -739,6 +759,8 @@ def handle_price_update(payload: PriceUpdatePayload) -> Dict[str, Any]:
         payload.current_15m_bias,
         safe_float(payload.latest_swing_low),
         safe_float(payload.latest_swing_high),
+        safe_float(payload.trail_ref_low),
+        safe_float(payload.trail_ref_high),
         raw_json(payload),
         safe_int(payload.bar_time, 0),
         now(),

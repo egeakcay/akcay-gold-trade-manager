@@ -52,7 +52,7 @@ REJECT_LOW_CONFIDENCE = os.getenv("REJECT_LOW_CONFIDENCE", "false").lower() == "
 MIN_CONFIDENCE_TO_ACCEPT = int(os.getenv("MIN_CONFIDENCE_TO_ACCEPT", "6"))
 FULL_CONFIDENCE_THRESHOLD = int(os.getenv("FULL_CONFIDENCE_THRESHOLD", "9"))
 
-app = FastAPI(title="AKÇAY Tactical Auto Trading — Execution Backend", version="3.0.0")
+app = FastAPI(title="AKÇAY Tactical Auto Trading — Execution Backend", version="3.1.0")
 
 # =============================================================
 # CONSTANTS
@@ -342,6 +342,34 @@ def migrate_db():
 
 init_db()
 migrate_db()
+
+def seed_autoincrement():
+    """v3.1: Bos (yeni) veritabaninda islem numaralandirmasini kaldigi yerden
+    devam ettir. SEED_NEXT_TRADE_ID env degiskeni ayarliysa ve trades tablosu
+    BOSSA, autoincrement sayaci seed-1'e kurulur -> ilk yeni kayit seed olur.
+    Dolu veritabaninda HICBIR SEY yapmaz (mevcut kuruluma zararsiz)."""
+    seed = os.getenv("SEED_NEXT_TRADE_ID", "")
+    if not seed:
+        return
+    try:
+        seed_val = int(seed) - 1
+        con = db()
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM trades")
+        trade_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM signals")
+        signal_count = cur.fetchone()[0]
+        if trade_count == 0 and signal_count == 0:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name IN ('trades','signals')")
+            cur.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('trades', ?)", (seed_val,))
+            cur.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('signals', ?)", (seed_val,))
+            con.commit()
+            print(f"SEED: bos DB tespit edildi, numaralandirma {seed}'den devam edecek")
+        con.close()
+    except Exception as exc:
+        print(f"SEED atlandi: {exc}")
+
+seed_autoincrement()
 
 # =============================================================
 # HELPERS
@@ -972,7 +1000,7 @@ def health():
     return {
         "status": "running",
         "time": now(),
-        "version": "execution_ready_v3",
+        "version": "execution_ready_v3.1_volume_seed",
         "supported_events": ["TRADE_SIGNAL", "PRICE_UPDATE", "entry"],
         "session_filter_enabled": SESSION_FILTER_ENABLED,
         "htf_gate": ENABLE_HTF_GATE,

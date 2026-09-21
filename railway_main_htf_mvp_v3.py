@@ -13,6 +13,8 @@ load_dotenv()
 
 # =============================================================
 # AKÇAY RAILWAY BACKEND — EXECUTION READY v3.0
+# v3.2 (2026-09-21): sabit "123abc456" webhook secret varsayilani kaldirildi;
+#   check_secret fail-closed (env tanimsizsa TUM webhook'lar 403). Baska degisiklik yok.
 # -------------------------------------------------------------
 # Supports:
 # - TradingView TRADE_SIGNAL payloads from Gold/Silver Pine
@@ -24,7 +26,7 @@ load_dotenv()
 # =============================================================
 # CONFIG
 # =============================================================
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", os.getenv("TV_SECRET", "123abc456"))
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or os.getenv("TV_SECRET") or "").strip()  # v3.2: sabit varsayilan kaldirildi
 DB = os.getenv("DB_NAME", os.getenv("DB_PATH", "akcay_mvp.db"))
 
 # Risk amount sent to MT5 executor. Executor converts this into lots.
@@ -52,7 +54,7 @@ REJECT_LOW_CONFIDENCE = os.getenv("REJECT_LOW_CONFIDENCE", "false").lower() == "
 MIN_CONFIDENCE_TO_ACCEPT = int(os.getenv("MIN_CONFIDENCE_TO_ACCEPT", "6"))
 FULL_CONFIDENCE_THRESHOLD = int(os.getenv("FULL_CONFIDENCE_THRESHOLD", "9"))
 
-app = FastAPI(title="AKÇAY Tactical Auto Trading — Execution Backend", version="3.1.0")
+app = FastAPI(title="AKÇAY Tactical Auto Trading — Execution Backend", version="3.2.0")
 
 # =============================================================
 # CONSTANTS
@@ -421,7 +423,8 @@ def normalize_instrument(instrument: str) -> str:
 
 
 def check_secret(secret: Optional[str]):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+    # v3.2: fail-closed — secret env tanimsizsa da reddet (eskiden kontrol atlaniyordu)
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
 
@@ -1000,7 +1003,7 @@ def health():
     return {
         "status": "running",
         "time": now(),
-        "version": "execution_ready_v3.1_volume_seed",
+        "version": "execution_ready_v3.2_secret_fail_closed",
         "supported_events": ["TRADE_SIGNAL", "PRICE_UPDATE", "entry"],
         "session_filter_enabled": SESSION_FILTER_ENABLED,
         "htf_gate": ENABLE_HTF_GATE,
